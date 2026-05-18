@@ -1,0 +1,31 @@
+# Build output
+build/
+
+# Compiled Python extension (built from bindings/seqengine_py.cpp)
+python/_seqengine*.pyd
+python/_seqengine*.so
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Object / library artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.exp
+*.pdb
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
