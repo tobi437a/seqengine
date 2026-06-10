@@ -126,6 +126,9 @@ static MatchResult play_match(const MCTSConfig& base_cfg, OpponentFn opp_fn,
                     m = opp_fn(s, move_rng);
                 }
                 if (!s.make_move(m)) break;
+                // Tree reuse: tell MCTS what was actually played (its own
+                // move and the opponent's) so the next search re-roots.
+                mcts.advance(m);
                 ++plies;
             }
             if (s.winner == mcts_seat)     r.wins++;
