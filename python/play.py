@@ -213,6 +213,15 @@ def human_turn(game):
                 print("  Enter row and column (e.g. '3 5')")
 
 
+def report_move(opponent_fn, action):
+    """Tell a tree-reusing opponent (MCTS) what was just played, so its
+    next search re-roots the kept tree instead of starting fresh. No-op
+    for plain-function opponents (heuristic, random)."""
+    advance = getattr(opponent_fn, 'advance', None)
+    if advance is not None:
+        advance(action)
+
+
 def ai_turn(game, opponent_fn):
     """Run opponent turn, return action tuple and info dict."""
     player = 1
@@ -305,6 +314,8 @@ def play():
                 time.sleep(1.5)
                 continue
 
+            report_move(opponent_fn, action)
+
             if 'sequences_formed' in info:
                 clear()
                 render_board(game)
@@ -333,6 +344,7 @@ def play():
             card_idx, row, col = action
             ai_card = game.hands[1][card_idx]
             _, _, _, info = game.step(action)
+            report_move(opponent_fn, action)
 
             clear()
             highlight = {(row, col)} if row >= 0 else set()
