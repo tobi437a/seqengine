@@ -55,7 +55,7 @@ except ImportError as e:
 
 from board_layout import ONE_EYED_JACK, TWO_EYED_JACK, SUITS, RANKS
 from game_engine import HAND_SIZE
-from seq_actions import action_to_int
+from seq_actions import action_to_int, int_to_action
 
 
 SUIT_IDX = {s: i for i, s in enumerate(SUITS)}
@@ -150,6 +150,22 @@ class MCTSOpponent:
         args = extract_state(game)
         card_idx, row, col = self.engine.suggest_move(*args)
         return action_to_int(card_idx, row, col)
+
+    def advance(self, action):
+        """Report a move actually played in the game — by either side, in
+        the order played — so tree_reuse can re-root the kept search
+        forest at the next call instead of starting from scratch.
+
+        Accepts a flat action int or a (card_idx, row, col) tuple;
+        row=col=-1 means a dead-card declaration. Optional: if never
+        called, every search starts from a fresh tree. Only report moves
+        whose card_idx is the true hand slot (a wrong slot can match the
+        wrong subtree); harnesses that don't track opponent slots should
+        simply not call this."""
+        if not isinstance(action, (tuple, list)):
+            action = int_to_action(int(action))
+        card_idx, row, col = action
+        self.engine.advance(int(card_idx), int(row), int(col))
 
     @property
     def last_stats(self):
