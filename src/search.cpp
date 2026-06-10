@@ -264,6 +264,12 @@ struct ISTree {
     const ISNode& at(int32_t i) const { return nodes[i]; }
 };
 
+// Persistent root-parallel forest, kept across suggest_move calls so
+// trees can be re-rooted along the actually-played moves (tree reuse).
+struct MCTSEngine::Forest {
+    std::vector<ISTree> trees;
+};
+
 // Binary search by move_key. Returns the index into node.children whose
 // key equals `key`, or -1 if not found.
 static inline int find_child_slot(const ISNode& node, uint16_t key) {
@@ -288,6 +294,47 @@ static inline int lower_bound_slot(const ISNode& node, uint16_t key) {
         else                              hi = mid;
     }
     return lo;
+}
+
+// Reset a tree to a single fresh root.
+static void reset_tree(ISTree& tree) {
+    tree.nodes.clear();
+    tree.nodes.emplace_back();
+}
+
+// Re-root `tree` at the node reached by following `path` (the moves
+// actually played since the tree's root was current) and drop everything
+// outside that subtree. Returns false — leaving the tree to be reset by
+// the caller — if any move on the path has no child node, or if the
+// destination has no children worth carrying.
+static bool reroot_tree(ISTree& tree, const std::vector<Move>& path) {
+    int32_t idx = 0;
+    for (Move m : path) {
+        const ISNode& node = tree.at(idx);
+        int slot = find_child_slot(node, move_key(m));
+        if (slot < 0) return false;
+        idx = node.children[slot].node_idx;
+    }
+    if (tree.at(idx).children.empty()) return false;
+
+    // Compact the kept subtree into a fresh arena in BFS order,
+    // remapping child node indices as we go. Each node has exactly one
+    // parent, so every kept node is moved exactly once. (Indexed access
+    // throughout — out.push_back may not invalidate out[i] here because
+    // of the reserve, but don't hold references across it anyway.)
+    std::vector<ISNode> out;
+    out.reserve(tree.nodes.size());
+    out.push_back(std::move(tree.nodes[idx]));
+    for (size_t i = 0; i < out.size(); ++i) {
+        for (size_t k = 0; k < out[i].children.size(); ++k) {
+            int32_t old = out[i].children[k].node_idx;
+            out[i].children[k].node_idx = int32_t(out.size());
+            out.push_back(std::move(tree.nodes[old]));
+        }
+    }
+    out[0].move_from_parent = Move{};
+    tree.nodes = std::move(out);
+    return true;
 }
 
 static int ismcts_iteration(ISTree& tree, GameState state,
@@ -331,9 +378,10 @@ static int ismcts_iteration(ISTree& tree, GameState state,
             }
         }
 
-        if (n_untried > 0) {
+        if (!cfg.lazy_expansion && n_untried > 0) {
             SEQ_PROFILE_SCOPE("MCTS::expand");
-            // Expand a uniformly random untried legal move, then roll out.
+            // Legacy width-first expansion: expand a uniformly random
+            // untried legal move, then roll out.
             int  pick = untried[rng.rand_int(0, n_untried - 1)];
             Move m    = legal.moves[pick];
             uint16_t k = move_key(m);
@@ -361,9 +409,10 @@ static int ismcts_iteration(ISTree& tree, GameState state,
 
         SEQ_PROFILE_SCOPE("MCTS::select_puct");
 
-        // All legal moves already have children. Compute a softmax
-        // prior over each legal move's shaping score, then pick the
-        // PUCT-best. Priors are recomputed per descent step because
+        // Compute a softmax prior over each legal move's shaping score,
+        // then pick the PUCT-best. (Legacy mode only reaches here once
+        // all legal moves have children; lazy mode scores unvisited
+        // moves with an FPU value and expands one only when selected.) Priors are recomputed per descent step because
         // the player's hand (and thus the per-move shaping score)
         // diverges across determinizations after a few plies.
         // Ties broken uniformly at random — without this, dead-card
@@ -397,7 +446,8 @@ static int ismcts_iteration(ISTree& tree, GameState state,
         }
         const double inv_sum_exp = 1.0 / sum_exp;
 
-        int32_t best_idx = -1;
+        int32_t best_idx = -1;   // node index of the chosen child, -1 if unvisited
+        int     best_i   = -1;   // index into legal.moves
         Move    best_move{};
         double  best_score = -std::numeric_limits<double>::infinity();
         int     n_tied = 0;
@@ -405,43 +455,95 @@ static int ismcts_iteration(ISTree& tree, GameState state,
         {
             ISNode& node = tree.at(node_idx);
 
-            // Σ_b N(s,b) over the currently-legal children. Every legal
-            // move has been expanded at least once by the time we reach
-            // this branch, so sum_visits ≥ legal.count ≥ 1.
+            // Σ_b N(s,b) over the currently-legal children. In legacy
+            // mode every legal move has been expanded by the time we
+            // reach this branch, so sum_visits ≥ legal.count ≥ 1. In
+            // lazy mode unvisited moves contribute 0.
             double sum_visits = 0.0;
             for (int i = 0; i < legal.count; ++i) {
-                sum_visits += double(
-                    tree.at(node.children[child_slot[i]].node_idx).visits);
+                if (child_slot[i] >= 0) {
+                    sum_visits += double(
+                        tree.at(node.children[child_slot[i]].node_idx).visits);
+                }
             }
-            const double sqrt_sum = std::sqrt(sum_visits);
+            // Lazy mode adds +1 under the √ so the very first selection
+            // at a node follows the prior instead of tying at explore=0.
+            const double sqrt_sum = cfg.lazy_expansion
+                ? std::sqrt(sum_visits + 1.0)
+                : std::sqrt(sum_visits);
+
+            // First-play urgency (lazy mode): unvisited moves score the
+            // node's own mean from the mover's perspective minus a small
+            // reduction, so they compete on prior + optimism instead of
+            // being force-expanded width-first.
+            double fpu_q = 0.0;
+            if (cfg.lazy_expansion) {
+                double parent_mean_p0 =
+                    node.visits > 0 ? node.value_p0 / node.visits : 0.0;
+                double parent_q = (player == 0) ? parent_mean_p0
+                                                : -parent_mean_p0;
+                fpu_q = parent_q - cfg.fpu_reduction;
+            }
 
             for (int i = 0; i < legal.count; ++i) {
-                ChildEntry& ce = node.children[child_slot[i]];
-                ISNode& c = tree.at(ce.node_idx);
-
-                double mean_p0 = c.value_p0 / std::max(1, c.visits);
-                double q       = (player == 0) ? mean_p0 : -mean_p0;
+                double  q, nvis;
+                int32_t ci = -1;
+                if (child_slot[i] >= 0) {
+                    ChildEntry& ce = node.children[child_slot[i]];
+                    ISNode& c = tree.at(ce.node_idx);
+                    double mean_p0 = c.value_p0 / std::max(1, c.visits);
+                    q    = (player == 0) ? mean_p0 : -mean_p0;
+                    nvis = double(c.visits);
+                    ci   = ce.node_idx;
+                } else {
+                    q    = fpu_q;
+                    nvis = 0.0;
+                }
                 double prior   = priors[i] * inv_sum_exp;
                 double explore = cfg.ucb_c * prior * sqrt_sum
-                                 / (1.0 + double(c.visits));
+                                 / (1.0 + nvis);
                 double score   = q + explore;
 
                 if (score > best_score + 1e-12) {
                     best_score = score;
-                    best_idx   = ce.node_idx;
-                    best_move  = ce.move;
+                    best_idx   = ci;
+                    best_i     = i;
+                    best_move  = legal.moves[i];
                     n_tied     = 1;
                 } else if (score > best_score - 1e-12) {
                     ++n_tied;
                     if (rng.rand_int(0, n_tied - 1) == 0) {
-                        best_idx  = ce.node_idx;
-                        best_move = ce.move;
+                        best_idx  = ci;
+                        best_i    = i;
+                        best_move = legal.moves[i];
                     }
                 }
             }
         }
 
-        if (best_idx < 0) break;                       // pathological
+        if (best_i < 0) break;                         // pathological
+
+        if (best_idx < 0) {
+            // Lazy expansion: the selected move has no node yet —
+            // materialize it now, then roll out from the fresh leaf.
+            SEQ_PROFILE_SCOPE("MCTS::expand");
+            uint16_t k = move_key(best_move);
+            int32_t new_idx = int32_t(tree.nodes.size());
+            tree.nodes.emplace_back();
+            tree.nodes.back().move_from_parent = best_move;
+
+            ISNode& node = tree.at(node_idx);
+            int pos = lower_bound_slot(node, k);
+            node.children.insert(node.children.begin() + pos,
+                                 ChildEntry{k, best_move, new_idx});
+
+            if (!state.make_move(best_move)) break;
+            node_idx = new_idx;
+            path[path_len++] = node_idx;
+            ++depth;
+            break;   // proceed to rollout from this fresh leaf
+        }
+
         if (!state.make_move(best_move)) break;
         node_idx = best_idx;
         path[path_len++] = node_idx;
@@ -480,16 +582,29 @@ MCTSEngine::MCTSEngine(MCTSConfig cfg) : cfg_(cfg) {
     }
 }
 
-// Build one ISMCTS tree and append its root-level visit counts to the
-// aggregator vectors. Each iteration re-determinizes the opponent's
-// hand and deck; multiple trees per call are purely a parallelism knob
-// (each tree builds independently and we aggregate at the end).
+// Out-of-line where Forest is complete.
+MCTSEngine::~MCTSEngine() = default;
+MCTSEngine::MCTSEngine(MCTSEngine&&) noexcept = default;
+MCTSEngine& MCTSEngine::operator=(MCTSEngine&&) noexcept = default;
+
+void MCTSEngine::advance(Move m) {
+    if (!cfg_.tree_reuse) return;
+    pending_.push_back(m);
+}
+
+// Run `budget` iterations on one ISMCTS tree and append its root-level
+// visit counts to the aggregator vectors. Each iteration re-determinizes
+// the opponent's hand and deck; multiple trees per call are purely a
+// parallelism knob (each tree builds independently and we aggregate at
+// the end). The tree is owned by the caller: fresh after reset_tree, or
+// carrying a re-rooted subtree from the previous move (tree reuse).
 struct PerTreeStats { int iterations; int max_depth; };
 
 static PerTreeStats run_one_tree(const GameState& s_in,
                                  Xoshiro256pp& rng,
                                  const MCTSConfig& cfg,
                                  int budget,
+                                 ISTree& tree,
                                  std::vector<int>& root_visits,
                                  std::vector<double>& root_value_p0,
                                  std::vector<Move>& root_moves)
@@ -497,7 +612,9 @@ static PerTreeStats run_one_tree(const GameState& s_in,
     int max_depth  = 0;
     int iters_done = 0;
 
-    ISTree tree(budget);
+    // Every iteration expands at most one node; reserving up-front keeps
+    // node indices valid across the emplace_backs inside the iteration.
+    tree.nodes.reserve(tree.nodes.size() + size_t(budget) + 2);
     for (int i = 0; i < budget; ++i) {
         int d = ismcts_iteration(tree, s_in, rng, cfg);
         if (d > max_depth) max_depth = d;
@@ -546,15 +663,17 @@ struct WorkerResult {
     int                 max_depth  = 0;
 };
 
-// Pure function — given an initial state and a seed, build `n_trees`
-// independent ISMCTS trees and return their aggregated root-move
-// statistics. No shared state, no locks; safe to call concurrently on
-// independent inputs.
+// Given an initial state and a seed, run `per_tree` iterations on each
+// of the `n_trees` trees in the caller-owned slice and return their
+// aggregated root-move statistics. Workers operate on disjoint tree
+// slices of the persistent forest — no shared state, no locks; safe to
+// call concurrently on independent slices.
 //
 // The function builds its own RNG from the given seed, so worker threads
 // are reproducible from (seed, config) alone.
 static WorkerResult run_worker(const GameState& s_in,
                                const MCTSConfig& cfg,
+                               ISTree* trees,
                                int n_trees,
                                int per_tree,
                                uint64_t seed)
@@ -562,7 +681,7 @@ static WorkerResult run_worker(const GameState& s_in,
     Xoshiro256pp rng(seed);
     WorkerResult r;
     for (int t = 0; t < n_trees; ++t) {
-        auto pt = run_one_tree(s_in, rng, cfg, per_tree,
+        auto pt = run_one_tree(s_in, rng, cfg, per_tree, trees[t],
                                r.visits, r.value_p0, r.moves);
         r.iterations += pt.iterations;
         if (pt.max_depth > r.max_depth) r.max_depth = pt.max_depth;
@@ -624,9 +743,31 @@ Move MCTSEngine::suggest_move(const GameState& s_in) {
     int n_trees  = std::max(1, cfg_.n_parallel_trees);
     int per_tree = std::max(1, cfg_.iterations / n_trees);
 
+    // Prepare the persistent forest. If tree reuse is on and the harness
+    // reported the moves played since the last search (via advance()),
+    // re-root each tree along that path, carrying its subtree statistics
+    // over. Any tree where the path dies — and every tree when there's
+    // no pending path (advance() never called, or first search) — resets
+    // to a fresh root, which reproduces the old search-from-scratch
+    // behavior exactly.
+    if (!forest_) forest_ = std::make_unique<Forest>();
+    Forest& forest = *forest_;
+    const bool try_reuse = cfg_.tree_reuse && !pending_.empty()
+                        && int(forest.trees.size()) == n_trees;
+    if (int(forest.trees.size()) != n_trees) {
+        forest.trees.clear();
+        forest.trees.reserve(size_t(n_trees));
+        for (int t = 0; t < n_trees; ++t) forest.trees.emplace_back(per_tree);
+    }
+    for (auto& tree : forest.trees) {
+        if (!(try_reuse && reroot_tree(tree, pending_))) reset_tree(tree);
+    }
+    pending_.clear();
+
     // Decide how many threads to use and how many trees each handles.
     // Pre-generate a seed for each worker from the engine RNG, then
-    // hand off — workers don't share rng_.
+    // hand off — workers don't share rng_. Each worker gets a disjoint
+    // contiguous slice of the forest's trees.
     auto split = partition_trees(n_trees, cfg_.n_threads);
     std::vector<uint64_t> seeds(split.size());
     for (auto& s : seeds) s = rng_();
@@ -635,17 +776,21 @@ Move MCTSEngine::suggest_move(const GameState& s_in) {
 
     if (split.size() == 1) {
         // Sequential fast path — no async overhead.
-        results[0] = run_worker(s_in, cfg_, split[0], per_tree, seeds[0]);
+        results[0] = run_worker(s_in, cfg_, forest.trees.data(),
+                                split[0], per_tree, seeds[0]);
     } else {
         // Parallel path — std::async with explicit launch::async so each
         // task actually gets a fresh thread (deferred would serialize).
         std::vector<std::future<WorkerResult>> futures;
         futures.reserve(split.size());
+        int tree_off = 0;
         for (size_t i = 0; i < split.size(); ++i) {
             futures.push_back(std::async(std::launch::async,
                                          run_worker, std::cref(s_in),
                                          std::cref(cfg_),
+                                         forest.trees.data() + tree_off,
                                          split[i], per_tree, seeds[i]));
+            tree_off += split[i];
         }
         for (size_t i = 0; i < futures.size(); ++i) {
             results[i] = futures[i].get();
