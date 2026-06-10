@@ -106,6 +106,10 @@ int main(int argc, char** argv) {
                         ? eng_a.suggest_move(s)
                         : eng_b.suggest_move(s);
             if (!s.make_move(m)) break;
+            // Tree reuse: report the played move to both engines so the
+            // profiled workload matches how the harnesses drive play.
+            eng_a.advance(m);
+            eng_b.advance(m);
             ++plies;
         }
         total_plies += plies;
