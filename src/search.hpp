@@ -62,6 +62,27 @@ struct MCTSConfig {
     // differences. Left as a feature flag for experimentation.
     bool   prefer_completing_moves = false;
 
+    // --- Lazy expansion (AlphaZero-style) ---
+    // When true, selection runs PUCT over ALL legal moves at a node —
+    // visited children use their empirical Q, unvisited moves use a
+    // first-play-urgency value of parent_q − fpu_reduction — and a node
+    // is only materialized when actually selected. When false (legacy),
+    // every untried legal move is force-expanded (uniformly at random)
+    // before PUCT selection kicks in, which at ~50 legal moves per node
+    // burns most of a small per-tree budget sweeping width-first.
+    bool   lazy_expansion    = true;
+    double fpu_reduction     = 0.10;    // unvisited Q = parent_q − this
+
+    // --- Tree reuse across moves ---
+    // When true, the engine keeps its root-parallel forest between
+    // suggest_move calls. The harness reports every actually-played move
+    // via advance(); at the next suggest_move each tree is re-rooted at
+    // the child matching the played move path, carrying over the
+    // subtree's visit statistics. If a played move has no node (or
+    // advance() was never called), the tree resets to a fresh root, so
+    // harnesses that don't call advance() get exactly the old behavior.
+    bool   tree_reuse        = true;
+
     uint64_t seed            = 0;       // 0 → random_device
 
     // --- Number of independent root-parallel trees ---
@@ -107,20 +128,33 @@ struct MCTSStats {
 class MCTSEngine {
 public:
     explicit MCTSEngine(MCTSConfig cfg = {});
+    ~MCTSEngine();
+    MCTSEngine(MCTSEngine&&) noexcept;
+    MCTSEngine& operator=(MCTSEngine&&) noexcept;
 
     // Choose a move for `s.current_player` to play. `s` is observed in
     // full; if cfg.determinize, the opponent's hand and deck are
     // resampled before search so we don't cheat on hidden info.
     Move suggest_move(const GameState& s);
 
+    // Tree reuse: report a move that was actually played in the game
+    // (by either side, in order). At the next suggest_move the kept
+    // forest is re-rooted along the reported path. Calling this is
+    // optional — if it's never called, every search starts fresh.
+    void advance(Move m);
+
     const MCTSStats& last_stats() const { return stats_; }
     MCTSConfig&       config()           { return cfg_; }
     const MCTSConfig& config() const     { return cfg_; }
 
 private:
+    struct Forest;                      // persistent root-parallel trees
+
     MCTSConfig    cfg_;
     Xoshiro256pp  rng_;
     MCTSStats     stats_;
+    std::unique_ptr<Forest> forest_;
+    std::vector<Move> pending_;         // moves played since last search
 };
 
 } // namespace seq
