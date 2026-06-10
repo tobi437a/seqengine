@@ -124,6 +124,9 @@ PYBIND11_MODULE(_seqengine, m) {
         .def_readwrite("determinize",             &MCTSConfig::determinize)
         .def_readwrite("length_decay",            &MCTSConfig::length_decay)
         .def_readwrite("prefer_completing_moves", &MCTSConfig::prefer_completing_moves)
+        .def_readwrite("lazy_expansion",          &MCTSConfig::lazy_expansion)
+        .def_readwrite("fpu_reduction",           &MCTSConfig::fpu_reduction)
+        .def_readwrite("tree_reuse",              &MCTSConfig::tree_reuse)
         .def_readwrite("n_parallel_trees",        &MCTSConfig::n_parallel_trees)
         .def_readwrite("n_threads",               &MCTSConfig::n_threads)
         .def_readwrite("seed",                    &MCTSConfig::seed)
@@ -169,5 +172,26 @@ PYBIND11_MODULE(_seqengine, m) {
              py::arg("dead_card_used"),
              "Pick a move for current_player. Returns (card_idx, row, col); "
              "row=col=-1 means a dead-card declaration.")
+        .def("advance",
+             [](MCTSEngine& eng, int card_idx, int row, int col) {
+                 Move m;
+                 m.card_idx = int8_t(card_idx);
+                 if (row < 0 || col < 0) {
+                     m.cell = Move::DEAD;
+                 } else {
+                     if (row >= N_ROWS || col >= N_COLS) {
+                         throw std::invalid_argument("row/col out of range");
+                     }
+                     m.cell = int8_t(cell_of(row, col));
+                 }
+                 eng.advance(m);
+             },
+             py::arg("card_idx"),
+             py::arg("row"),
+             py::arg("col"),
+             "Report a move actually played in the game (by either side, "
+             "in order) so tree_reuse can re-root the kept forest at the "
+             "next suggest_move. row=col=-1 means a dead-card declaration. "
+             "Optional: if never called, every search starts fresh.")
         .def("last_stats", [](MCTSEngine& eng) { return eng.last_stats(); });
 }
