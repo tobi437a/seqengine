@@ -62,6 +62,13 @@ struct Args {
     int      dev_lazy      = 1;
     int      base_reuse    = 0;
     int      dev_reuse     = 1;
+    // Truncated rollouts (0 = play to terminal) and their static eval.
+    int      base_cutoff   = 12;
+    int      dev_cutoff    = 12;
+    double   base_cscale   = 0.2;
+    double   dev_cscale    = 0.2;
+    double   base_cbonus   = 4.0;
+    double   dev_cbonus    = 4.0;
     double   elo0          = 0.0;
     double   elo1          = 5.0;
     double   alpha         = 0.05;
@@ -82,6 +89,9 @@ struct Args {
         "  --base-trees N --dev-trees N   number of root-parallel trees\n"
         "  --base-lazy 0|1 --dev-lazy 0|1   lazy expansion + FPU (default base=0 dev=1)\n"
         "  --base-reuse 0|1 --dev-reuse 0|1 tree reuse across moves (default base=0 dev=1)\n"
+        "  --base-cutoff N --dev-cutoff N   rollout truncation in plies (default 12; 0 = full rollouts)\n"
+        "  --base-cscale X --dev-cscale X   tanh scale of the cutoff eval (default 0.2)\n"
+        "  --base-cbonus X --dev-cbonus X   per-sequence bonus in the cutoff eval (default 4.0)\n"
         "  --elo0 X --elo1 Y              SPRT bounds in Elo (default 0 / 5)\n"
         "  --alpha X --beta X             type-I / type-II error rates (default 0.05 / 0.05)\n"
         "  --max-pairs N                  hard cap on game pairs (default 20000)\n"
@@ -123,6 +133,12 @@ static Args parse_args(int argc, char** argv) {
         else if (f == "--dev-lazy")     a.dev_lazy     = std::atoi(need(i, f.c_str()));
         else if (f == "--base-reuse")   a.base_reuse   = std::atoi(need(i, f.c_str()));
         else if (f == "--dev-reuse")    a.dev_reuse    = std::atoi(need(i, f.c_str()));
+        else if (f == "--base-cutoff")  a.base_cutoff  = std::atoi(need(i, f.c_str()));
+        else if (f == "--dev-cutoff")   a.dev_cutoff   = std::atoi(need(i, f.c_str()));
+        else if (f == "--base-cscale")  a.base_cscale  = std::atof(need(i, f.c_str()));
+        else if (f == "--dev-cscale")   a.dev_cscale   = std::atof(need(i, f.c_str()));
+        else if (f == "--base-cbonus")  a.base_cbonus  = std::atof(need(i, f.c_str()));
+        else if (f == "--dev-cbonus")   a.dev_cbonus   = std::atof(need(i, f.c_str()));
         else if (f == "--elo0")         a.elo0         = std::atof(need(i, f.c_str()));
         else if (f == "--elo1")         a.elo1         = std::atof(need(i, f.c_str()));
         else if (f == "--alpha")        a.alpha        = std::atof(need(i, f.c_str()));
@@ -265,6 +281,9 @@ static void print_header(const Args& a) {
                 a.base_lazy, a.base_reuse,
                 a.dev_iters,  a.dev_ucb_c,  a.dev_eps,  a.dev_trees,
                 a.dev_lazy, a.dev_reuse);
+    std::printf("      base [cutoff=%d cscale=%.2f cbonus=%.2f]  vs  dev [cutoff=%d cscale=%.2f cbonus=%.2f]\n",
+                a.base_cutoff, a.base_cscale, a.base_cbonus,
+                a.dev_cutoff,  a.dev_cscale,  a.dev_cbonus);
     std::printf("H0: elo <= %.1f   H1: elo >= %.1f   alpha=%.3f beta=%.3f\n",
                 a.elo0, a.elo1, a.alpha, a.beta);
     std::printf("Bounds: LLR in [%.3f, %.3f]   max_pairs=%d   workers=%d\n\n",
@@ -298,6 +317,9 @@ int main(int argc, char** argv) {
     base_cfg.n_parallel_trees = a.base_trees;
     base_cfg.lazy_expansion   = a.base_lazy != 0;
     base_cfg.tree_reuse       = a.base_reuse != 0;
+    base_cfg.rollout_cutoff   = a.base_cutoff;
+    base_cfg.cutoff_scale     = a.base_cscale;
+    base_cfg.cutoff_seq_bonus = a.base_cbonus;
     base_cfg.n_threads        = 1;  // game-level parallelism only
 
     dev_cfg.iterations        = a.dev_iters;
@@ -306,6 +328,9 @@ int main(int argc, char** argv) {
     dev_cfg.n_parallel_trees  = a.dev_trees;
     dev_cfg.lazy_expansion    = a.dev_lazy != 0;
     dev_cfg.tree_reuse        = a.dev_reuse != 0;
+    dev_cfg.rollout_cutoff    = a.dev_cutoff;
+    dev_cfg.cutoff_scale      = a.dev_cscale;
+    dev_cfg.cutoff_seq_bonus  = a.dev_cbonus;
     dev_cfg.n_threads         = 1;
 
     print_header(a);

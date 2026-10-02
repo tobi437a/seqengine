@@ -60,6 +60,25 @@ inline double total_phi(const GameState& s, int player) {
     return total;
 }
 
+// total_phi(s, 0) - total_phi(s, 1) in one pass over the windows. The
+// two sums accumulate separately in window order, so the result is bit-
+// identical to calling total_phi twice.
+inline double phi_diff_p0(const GameState& s) {
+    const BB100 b0 = s.chips[0] | s.locked[0];
+    const BB100 b1 = s.chips[1] | s.locked[1];
+    const BB100 m0 = b0 | JOKER_MASK;
+    const BB100 m1 = b1 | JOKER_MASK;
+    double t0 = 0.0, t1 = 0.0;
+    for (int i = 0; i < N_WINDOWS; ++i) {
+        const BB100 w = WINDOW_MASKS[i];
+        const bool has0 = (w & b0).any();
+        const bool has1 = (w & b1).any();
+        t0 += has1 ? 0.0 : PHI_WINDOW_WEIGHTS[(w & m0).popcount()];
+        t1 += has0 ? 0.0 : PHI_WINDOW_WEIGHTS[(w & m1).popcount()];
+    }
+    return t0 - t1;
+}
+
 // Sum over windows passing through `cell` only (≤ 20 windows). Used for
 // shaping-reward deltas: only these windows can have their value changed
 // by a move at `cell`, so we don't need a full-board scan.
@@ -103,52 +122,70 @@ inline ShapingMasks build_shaping_masks(const GameState& s, int player) {
 // the hand slot) because at the eval stage we only care whether it's a
 // one-eyed jack (chip-removal) or a chip-placement.
 //
-// One window-loop pass folds all four before/after x me/opp evaluations
-// into the running delta. This replaces four separate affected_phi calls
-// that each rebuilt their own masks and re-walked the windows through
-// `cell` -- about 80 window evaluations per move drops to about 20.
-inline double shaping_score(const ShapingMasks& pre, int card_type, int cell) {
-    if (cell < 0) return 0.0;  // dead-card swap
+// Conceptually each window through `cell` contributes
+//     γ·me_after − me_before + opp_before − γ·opp_after
+// where me_* / opp_* are window_phi from each side before and after the
+// move. Every window in CELL_WINDOWS[cell] contains `cell`, so the four
+// terms collapse to two mask tests and at most two popcounts:
+//
+//   placement (cell empty, not a joker):
+//     me:  opp blocking is unchanged; my count goes pc -> pc+1.
+//     opp: after the move my chip sits in the window, so opp_after = 0.
+//     => the term depends only on the window, not on `cell` — which is
+//        what lets ShapingCache memoize it per window.
+//   removal (cell holds an unlocked opp chip):
+//     me:  before, opp's chip at `cell` blocks the window -> me_before = 0.
+//     opp: my blocking is unchanged; opp's count goes oc -> oc-1.
+//
+// The accumulation keeps the exact expression shape of the four-term
+// form (structurally-zero terms written as 0.0), so results are bit-
+// identical to it.
+namespace detail {
+inline double placement_window_term(const ShapingMasks& pre, int win_idx) {
+    const BB100 w = WINDOW_MASKS[win_idx];
+    double me_before = 0.0, me_after = 0.0, opp_before = 0.0;
+    if (!(w & pre.o_blocker).any()) {
+        const int pc = (w & pre.p_mask).popcount();
+        me_before = PHI_WINDOW_WEIGHTS[pc];
+        me_after  = PHI_WINDOW_WEIGHTS[pc + 1];
+    }
+    if (!(w & pre.p_blocker).any()) {
+        opp_before = PHI_WINDOW_WEIGHTS[(w & pre.o_mask).popcount()];
+    }
+    return SHAPING_GAMMA * me_after - me_before
+         + opp_before - SHAPING_GAMMA * 0.0;
+}
 
-    // Post-move masks: exactly one bit differs between before and after.
-    //   one-eyed jack: opp's UNLOCKED chip at `cell` is removed -> clear
-    //                  the bit in o_mask and o_blocker (locked[opp] does
-    //                  not have it by precondition, and `cell` is not a
-    //                  joker corner since opp has a chip there).
-    //   placement:     player's chip lands on an empty cell -> set the
-    //                  bit in p_mask and p_blocker.
-    //
-    // Built with | / & ~ rather than copy-then-set/reset so all four
-    // posts are const for the window loop — leaves the compiler free to
-    // keep them in registers across the 20-window pass instead of
-    // treating the local as a freshly-written, possibly-aliased object.
+inline double removal_score(const ShapingMasks& pre, int cell) {
     BB100 cb; cb.set(cell);
-    const bool is_remove = (card_type == ONE_EYED_JACK);
-    const BB100 not_cb         = ~cb;
-    const BB100 p_mask_post    = is_remove ? pre.p_mask    : pre.p_mask    | cb;
-    const BB100 p_blocker_post = is_remove ? pre.p_blocker : pre.p_blocker | cb;
-    const BB100 o_mask_post    = is_remove ? pre.o_mask    & not_cb : pre.o_mask;
-    const BB100 o_blocker_post = is_remove ? pre.o_blocker & not_cb : pre.o_blocker;
-
+    const BB100 o_blocker_post = pre.o_blocker & ~cb;
     const int16_t* ws = CELL_WINDOWS[cell];
     double delta = 0.0;
     for (int i = 0; ws[i] >= 0; ++i) {
         const BB100 w = WINDOW_MASKS[ws[i]];
-
-        // From player's perspective: opp's blocker blocks, count p_mask.
-        const double me_before = (w & pre.o_blocker).any() ? 0.0
-            : PHI_WINDOW_WEIGHTS[(w & pre.p_mask).popcount()];
-        const double me_after  = (w & o_blocker_post).any() ? 0.0
-            : PHI_WINDOW_WEIGHTS[(w & p_mask_post).popcount()];
-
-        // From opp's perspective: player's blocker blocks, count o_mask.
-        const double opp_before = (w & pre.p_blocker).any() ? 0.0
-            : PHI_WINDOW_WEIGHTS[(w & pre.o_mask).popcount()];
-        const double opp_after  = (w & p_blocker_post).any() ? 0.0
-            : PHI_WINDOW_WEIGHTS[(w & o_mask_post).popcount()];
-
-        delta += SHAPING_GAMMA * me_after - me_before
+        double me_after = 0.0, opp_before = 0.0, opp_after = 0.0;
+        if (!(w & o_blocker_post).any()) {
+            me_after = PHI_WINDOW_WEIGHTS[(w & pre.p_mask).popcount()];
+        }
+        if (!(w & pre.p_blocker).any()) {
+            const int oc = (w & pre.o_mask).popcount();
+            opp_before = PHI_WINDOW_WEIGHTS[oc];
+            opp_after  = PHI_WINDOW_WEIGHTS[oc - 1];
+        }
+        delta += SHAPING_GAMMA * me_after - 0.0
                + opp_before - SHAPING_GAMMA * opp_after;
+    }
+    return delta;
+}
+} // namespace detail
+
+inline double shaping_score(const ShapingMasks& pre, int card_type, int cell) {
+    if (cell < 0) return 0.0;  // dead-card swap
+    if (card_type == ONE_EYED_JACK) return detail::removal_score(pre, cell);
+    const int16_t* ws = CELL_WINDOWS[cell];
+    double delta = 0.0;
+    for (int i = 0; ws[i] >= 0; ++i) {
+        delta += detail::placement_window_term(pre, ws[i]);
     }
     return delta;
 }
@@ -179,6 +216,12 @@ struct ShapingCache {
     const ShapingMasks& masks;
     double  scores[2][N_CELLS];
     uint8_t seen[2][N_CELLS] = {};
+    // Placement terms are a function of the window alone (see
+    // placement_window_term), and neighbouring cells share most of their
+    // windows — memoize per window too. A two-eyed jack in hand otherwise
+    // re-evaluates each window ~5x across the ~90 cells it can reach.
+    double  wterm[N_WINDOWS];
+    uint8_t wseen[N_WINDOWS] = {};
 
     explicit ShapingCache(const ShapingMasks& m) : masks(m) {}
 
@@ -188,10 +231,27 @@ struct ShapingCache {
         if (cell < 0) return 0.0;
         const int f = (card_type == ONE_EYED_JACK) ? 1 : 0;
         if (!seen[f][cell]) {
-            scores[f][cell] = shaping_score(masks, card_type, cell);
+            scores[f][cell] = f ? detail::removal_score(masks, cell)
+                                : placement_score(cell);
             seen[f][cell]   = 1;
         }
         return scores[f][cell];
+    }
+
+private:
+    // Same summation order as shaping_score -> bit-identical result.
+    double placement_score(int cell) {
+        const int16_t* ws = CELL_WINDOWS[cell];
+        double delta = 0.0;
+        for (int i = 0; ws[i] >= 0; ++i) {
+            const int w = ws[i];
+            if (!wseen[w]) {
+                wterm[w] = detail::placement_window_term(masks, w);
+                wseen[w] = 1;
+            }
+            delta += wterm[w];
+        }
+        return delta;
     }
 };
 

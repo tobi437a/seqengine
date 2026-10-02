@@ -90,6 +90,7 @@ COMPETE_BIN   := $(BUILD)/compete
 TUNE_BIN      := $(BUILD)/tune
 ABLATION_BIN  := $(BUILD)/ablation
 PROFILE_BIN   := $(BUILD)/profile
+SPRT_BIN      := $(BUILD)/sprt
 
 # Python extension. EXT_SUFFIX is e.g. .cpython-312-x86_64-linux-gnu.so,
 # .cp312-win_amd64.pyd, .cpython-312-darwin.so — whatever the host Python
@@ -102,7 +103,7 @@ PY_MODULE     := python/_seqengine$(PY_EXT_SUFFIX)
 
 # --- targets ---------------------------------------------------------------
 
-.PHONY: all test codegen validate bench compete tune ablation profile python pydeps clean
+.PHONY: all test codegen validate bench compete tune ablation profile sprt python pydeps clean
 
 all: $(TEST_BIN) $(EVAL_DUMP_BIN) $(BENCH_BIN) $(COMPETE_BIN) $(TUNE_BIN) $(ABLATION_BIN)
 
@@ -146,6 +147,10 @@ $(TUNE_BIN): tools/tune.cpp $(ENGINE_OBJS) $(ENGINE_HDRS)
 $(ABLATION_BIN): tools/ablation.cpp $(ENGINE_OBJS) $(ENGINE_HDRS)
 	@$(MKDIR_P) $(BUILD)
 	$(CXX) $(CXXFLAGS) -Isrc tools/ablation.cpp $(ENGINE_OBJS) -o $@
+
+$(SPRT_BIN): tools/sprt.cpp $(ENGINE_OBJS) $(ENGINE_HDRS)
+	@$(MKDIR_P) $(BUILD)
+	$(CXX) $(CXXFLAGS) -Isrc tools/sprt.cpp $(ENGINE_OBJS) -o $@
 
 # Profile driver — built against the instrumented engine objects, so the
 # RAII timers in src/profile.hpp actually record. The driver itself is
@@ -196,6 +201,9 @@ tune: $(TUNE_BIN)
 
 ablation: $(ABLATION_BIN)
 	./$(ABLATION_BIN)
+
+sprt: $(SPRT_BIN)
+	./$(SPRT_BIN) $(SPRT_ARGS)
 
 # Play 5 full MCTS-vs-MCTS games with the profile instrumentation
 # active, then print a sorted breakdown of where time was spent and how

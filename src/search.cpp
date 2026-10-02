@@ -172,11 +172,20 @@ static double rollout(GameState& state, Xoshiro256pp& rng,
     SEQ_PROFILE_SCOPE("MCTS::rollout");
     int plies = 0;
     MoveList moves;
-    for (; plies < cfg.max_rollout_steps && !state.done; ++plies) {
+    const int max_plies = cfg.rollout_cutoff > 0
+        ? std::min(cfg.rollout_cutoff, cfg.max_rollout_steps)
+        : cfg.max_rollout_steps;
+    for (; plies < max_plies && !state.done; ++plies) {
         state.legal_moves(moves);
         if (moves.count == 0) break;
         Move m = pick_rollout_move(state, moves, rng, cfg);
         if (!state.make_move(m)) break;
+    }
+    if (!state.done && cfg.rollout_cutoff > 0 && plies >= max_plies) {
+        const double d = phi_diff_p0(state)
+                       + cfg.cutoff_seq_bonus
+                         * double(state.sequences[0] - state.sequences[1]);
+        return std::tanh(cfg.cutoff_scale * d);
     }
     double terminal = terminal_value_p0(state);   // ±1 or 0
     if (terminal == 0.0) return 0.0;              // truncated / draw

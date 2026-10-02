@@ -25,7 +25,7 @@ import game_engine as ge
 import board_layout as bl
 
 ROOT = os.path.normpath(os.path.join(HERE, '..'))
-BINARY = os.path.join(ROOT, 'build', 'eval_dump')
+BINARY = os.path.join(ROOT, 'build', 'eval_dump' + ('.exe' if os.name == 'nt' else ''))
 
 TOL = 1e-8
 

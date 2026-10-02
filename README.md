@@ -144,10 +144,15 @@ From `make bench` on an 8-core / 16-thread dev box (16 threads, `-O3`):
 
 | Workload                       | Throughput          |
 |--------------------------------|---------------------|
-| `total_phi` (192-window eval)  | ~19.7M calls/s      |
-| Random rollouts (full games)   | ~1.1M games/s       |
-| Heuristic decision             | ~4.9M decisions/s   |
-| MCTS iterations (game-avg)     | ~259.2k iters/s     |
+| `total_phi` (192-window eval)  | ~20M calls/s        |
+| Random rollouts (full games)   | ~1.2M games/s       |
+| Heuristic decision             | ~8.4M decisions/s   |
+| MCTS iterations (game-avg)     | ~808k iters/s       |
+
+The MCTS row went from ~336k to ~808k iters/s on the same box: ~1.45×
+from a cheaper, per-window-memoized `shaping_score` (bit-identical
+results — seeded games replay move-for-move), the rest from truncated
+rollouts (MCTS design §10).
 
 The MCTS row averages 1000-iter searches over 20 sampled mid-game
 positions. The initial position alone is ~2× slower because rollouts from an empty board are
@@ -302,6 +307,16 @@ per-iteration determinization:
    defaults `n_threads=0` (auto via `hardware_concurrency()`, capped
    at `min(n_parallel_trees, 16)`); the C++ default is `n_threads=1` so
    tests, benchmarks, and the compete harness stay deterministic.
+
+10. **Truncated rollouts.** (`cfg.rollout_cutoff`, default 12.) A
+   rollout still running after 12 plies stops and is scored as
+   tanh(0.2 · (Φ0 − Φ1 + 4 · (seq0 − seq1))), Φp = `total_phi(s, p)`.
+   Set `rollout_cutoff = 0` for full playouts. In-process A/B vs full
+   rollouts (lazy + reuse on both sides): **+62 Elo** at 800 iters
+   (600 pairs, CI +46..+79; plateau over cutoff 8–16, scale 0.1–0.25,
+   bonus 3–6) and **+34 Elo** at 4000 iters (400 pairs, CI +15..+54) —
+   at equal *iterations*, so the ~1.6× per-iteration speedup is on top.
+   Not yet verified at 16k+ iterations.
 
 ### What was tried and rejected
 

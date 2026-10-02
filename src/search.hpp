@@ -53,6 +53,18 @@ struct MCTSConfig {
     // winning continuations exist and we want the shortest one.
     double length_decay      = 1.0;
 
+    // --- Truncated rollouts ---
+    // rollout_cutoff = 0 plays every rollout to terminal. With N > 0 (default
+    // 12) a
+    // rollout that is still running after N plies stops and scores the
+    // position statically (P0 perspective):
+    //     tanh(cutoff_scale · (Φ0 − Φ1 + cutoff_seq_bonus · (seq0 − seq1)))
+    // where Φp = total_phi(s, p). Shorter rollouts are cheaper, and the
+    // static eval is lower-variance than a long ε-greedy playout.
+    int    rollout_cutoff    = 12;
+    double cutoff_scale      = 0.2;
+    double cutoff_seq_bonus  = 4.0;
+
     // --- Rollout policy ---
     // When true, the rollout policy will take a sequence-completing
     // move whenever one is available, overriding the ε-greedy choice.
