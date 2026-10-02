@@ -156,10 +156,24 @@ def make_game(engine_player, engine_hand):
 
 # --- move application -----------------------------------------------------
 
+def _reveal(game, player, card, card_idx, info):
+    """Account for a card leaving a hand. The engine's cards were already
+    taken out of the unseen pool when they were dealt or drawn, so only
+    clear its slot; an opponent's card is seen for the first time now."""
+    if card_idx is not None:
+        game.hands[player][card_idx] = None
+        return
+    try:
+        game.deck.remove(card)
+    except ValueError:
+        info['card_not_in_pool'] = True
+
+
 def apply_move(game, player, card, card_idx, row, col):
     """
     Apply a move. Updates board, sequences, current_player, dead-card flag,
-    and removes the played card from the unseen pool (game.deck).
+    and, for the opponent, removes the played card from the unseen pool
+    (game.deck).
 
     For the engine's moves, pass card_idx (the slot it came from); we'll
     clear that slot, and the caller is expected to refill it with whatever
@@ -175,12 +189,7 @@ def apply_move(game, player, card, card_idx, row, col):
     if row == -1 and col == -1:
         info['dead_card'] = True
         game.dead_card_used[player] = True
-        try:
-            game.deck.remove(card)
-        except ValueError:
-            info['card_not_in_pool'] = True
-        if card_idx is not None:
-            game.hands[player][card_idx] = None
+        _reveal(game, player, card, card_idx, info)
         return info
 
     my_chip  = PLAYER0 if player == 0 else PLAYER1
@@ -215,13 +224,7 @@ def apply_move(game, player, card, card_idx, row, col):
         game.winner = player
         info['winner'] = player
 
-    try:
-        game.deck.remove(card)
-    except ValueError:
-        info['card_not_in_pool'] = True
-
-    if card_idx is not None:
-        game.hands[player][card_idx] = None
+    _reveal(game, player, card, card_idx, info)
 
     game.dead_card_used[player] = False
     game.current_player         = 1 - player
@@ -817,9 +820,6 @@ class GameScreen(tk.Frame):
         p.focus_entry()
         return p
 
-    def _warn(self, text):
-        self._text(text, color=DANGER)
-
     # --- engine turn ----------------------------------------------------
 
     def start_engine_turn(self):
@@ -911,9 +911,6 @@ class GameScreen(tk.Frame):
         self._text(self.pending['stats'], size=10)
         if self.pending['info'].get('sequences_formed'):
             self._text('★ That completes a sequence!', color=ACCENT, size=13)
-        if self.pending['info'].get('card_not_in_pool'):
-            self._warn('(Card tracking looks off — that card was already '
-                       'counted as seen.)')
 
         tk.Frame(self.action, bg=PANEL_2, height=2).pack(fill='x', pady=12)
         tk.Label(self.action, text='Then draw a card for the engine and tap it:',
