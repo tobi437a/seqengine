@@ -1,6 +1,9 @@
 # Build output
 build/
 
+# Recorded games from play.py
+games/
+
 # Compiled Python extension (built from bindings/seqengine_py.cpp)
 python/_seqengine*.pyd
 python/_seqengine*.so

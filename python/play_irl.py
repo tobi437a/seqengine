@@ -263,6 +263,8 @@ DANGER     = '#ff6b6b'
 CARD_BG    = '#fbf8f0'
 CARD_DIM   = '#8b8f99'
 CORNER_BG  = '#e9dcbc'
+LEGAL_BG   = '#cdeec3'
+LEGAL_EDGE = '#2f9e44'
 RED_INK    = '#c62828'
 BLACK_INK  = '#1b1b1b'
 
@@ -392,7 +394,7 @@ class BoardView(tk.Canvas):
         super().__init__(parent, bg=BG, highlightthickness=0)
         self.colors     = colors      # player -> colour name
         self.game       = None
-        self.marks      = {}          # (r, c) -> 'engine' | 'remove' | 'opp' | 'pending'
+        self.marks      = {}          # (r, c) -> 'engine' | 'remove' | 'opp' | 'pending' | 'legal'
         self.clickable  = None
         self.on_click   = None
         self.hover      = None
@@ -433,9 +435,10 @@ class BoardView(tk.Canvas):
                     self.create_text((x0 + x1) / 2, (y0 + y1) / 2, text='★',
                                      fill='#9c7a2c', font=(FONT, -int(s * .42)))
                     continue
-                lit = self.marks.get((r, c)) in ('engine', 'remove', 'pending')
-                self.create_rectangle(x0, y0, x1, y1, outline='',
-                                      fill='#ffe58a' if lit else CARD_BG)
+                mark = self.marks.get((r, c))
+                fill = ('#ffe58a' if mark in ('engine', 'remove', 'pending')
+                        else LEGAL_BG if mark == 'legal' else CARD_BG)
+                self.create_rectangle(x0, y0, x1, y1, outline='', fill=fill)
                 ink = RED_INK if is_red(cell) else BLACK_INK
                 if chip == EMPTY:
                     self.create_text((x0 + x1) / 2, (y0 + y1) / 2,
@@ -463,6 +466,9 @@ class BoardView(tk.Canvas):
             if kind == 'opp':
                 self.create_rectangle(x0, y0, x1, y1, outline='white',
                                       width=3, dash=(6, 4))
+            elif kind == 'legal':
+                self.create_rectangle(x0, y0, x1, y1, outline=LEGAL_EDGE,
+                                      width=3)
             elif kind == 'remove':
                 cx, cy, rad = (x0 + x1) / 2, (y0 + y1) / 2, s * .32
                 self.create_rectangle(x0, y0, x1, y1, outline=ACCENT, width=5,

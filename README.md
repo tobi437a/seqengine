@@ -8,7 +8,7 @@ binding and a self-contained Python harness.
 ```bash
 make python      # build the C++ engine + pybind11 module
 cd python
-python3 play.py  # interactive game; pick [1] for MCTS
+python3 play.py  # GUI game against the engine; every game is logged to games/
 ```
 
 `make python` needs a C++20 compiler, GNU Make, and `pip install pybind11`.
@@ -82,9 +82,10 @@ python/                    # End-user Python — fully self-contained
                            translates a SequenceGame to the primitive arrays
                            the C++ side expects, then returns an action_int
                            in the standard (slot * 101 + pos) encoding.
-  play.py                  Interactive UI. Three opponents: MCTS, heuristic,
-                           random. Falls back to heuristic if the binding
-                           wasn't compiled.
+  play.py                  GUI game against MCTS, heuristic or random (falls
+                           back to heuristic if the binding wasn't compiled).
+                           Records every move, with hands, board and engine
+                           stats, to games/*.json for later analysis.
   _seqengine.<…>.so        (built artifact — appears after `make python`)
 
 tools/                     # Dev/CI utilities — not needed for end-user play
