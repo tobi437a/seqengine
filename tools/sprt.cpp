@@ -69,6 +69,10 @@ struct Args {
     double   dev_cscale    = 0.2;
     double   base_cbonus   = 4.0;
     double   dev_cbonus    = 4.0;
+    double   base_j2       = 3.0;
+    double   dev_j2        = 3.0;
+    double   base_j1       = 1.5;
+    double   dev_j1        = 1.5;
     double   elo0          = 0.0;
     double   elo1          = 5.0;
     double   alpha         = 0.05;
@@ -92,6 +96,8 @@ struct Args {
         "  --base-cutoff N --dev-cutoff N   rollout truncation in plies (default 12; 0 = full rollouts)\n"
         "  --base-cscale X --dev-cscale X   tanh scale of the cutoff eval (default 0.2)\n"
         "  --base-cbonus X --dev-cbonus X   per-sequence bonus in the cutoff eval (default 4.0)\n"
+        "  --base-j2 X --dev-j2 X         two-eyed jack hand value (default 3.0; 0 = off)\n"
+        "  --base-j1 X --dev-j1 X         one-eyed jack hand value (default 1.5; 0 = off)\n"
         "  --elo0 X --elo1 Y              SPRT bounds in Elo (default 0 / 5)\n"
         "  --alpha X --beta X             type-I / type-II error rates (default 0.05 / 0.05)\n"
         "  --max-pairs N                  hard cap on game pairs (default 20000)\n"
@@ -139,6 +145,10 @@ static Args parse_args(int argc, char** argv) {
         else if (f == "--dev-cscale")   a.dev_cscale   = std::atof(need(i, f.c_str()));
         else if (f == "--base-cbonus")  a.base_cbonus  = std::atof(need(i, f.c_str()));
         else if (f == "--dev-cbonus")   a.dev_cbonus   = std::atof(need(i, f.c_str()));
+        else if (f == "--base-j2")      a.base_j2      = std::atof(need(i, f.c_str()));
+        else if (f == "--dev-j2")       a.dev_j2       = std::atof(need(i, f.c_str()));
+        else if (f == "--base-j1")      a.base_j1      = std::atof(need(i, f.c_str()));
+        else if (f == "--dev-j1")       a.dev_j1       = std::atof(need(i, f.c_str()));
         else if (f == "--elo0")         a.elo0         = std::atof(need(i, f.c_str()));
         else if (f == "--elo1")         a.elo1         = std::atof(need(i, f.c_str()));
         else if (f == "--alpha")        a.alpha        = std::atof(need(i, f.c_str()));
@@ -284,6 +294,8 @@ static void print_header(const Args& a) {
     std::printf("      base [cutoff=%d cscale=%.2f cbonus=%.2f]  vs  dev [cutoff=%d cscale=%.2f cbonus=%.2f]\n",
                 a.base_cutoff, a.base_cscale, a.base_cbonus,
                 a.dev_cutoff,  a.dev_cscale,  a.dev_cbonus);
+    std::printf("      base [j2=%.2f j1=%.2f]  vs  dev [j2=%.2f j1=%.2f]\n",
+                a.base_j2, a.base_j1, a.dev_j2, a.dev_j1);
     std::printf("H0: elo <= %.1f   H1: elo >= %.1f   alpha=%.3f beta=%.3f\n",
                 a.elo0, a.elo1, a.alpha, a.beta);
     std::printf("Bounds: LLR in [%.3f, %.3f]   max_pairs=%d   workers=%d\n\n",
@@ -320,6 +332,8 @@ int main(int argc, char** argv) {
     base_cfg.rollout_cutoff   = a.base_cutoff;
     base_cfg.cutoff_scale     = a.base_cscale;
     base_cfg.cutoff_seq_bonus = a.base_cbonus;
+    base_cfg.jack2_value      = a.base_j2;
+    base_cfg.jack1_value      = a.base_j1;
     base_cfg.n_threads        = 1;  // game-level parallelism only
 
     dev_cfg.iterations        = a.dev_iters;
@@ -331,6 +345,8 @@ int main(int argc, char** argv) {
     dev_cfg.rollout_cutoff    = a.dev_cutoff;
     dev_cfg.cutoff_scale      = a.dev_cscale;
     dev_cfg.cutoff_seq_bonus  = a.dev_cbonus;
+    dev_cfg.jack2_value       = a.dev_j2;
+    dev_cfg.jack1_value       = a.dev_j1;
     dev_cfg.n_threads         = 1;
 
     print_header(a);

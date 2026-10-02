@@ -65,6 +65,18 @@ struct MCTSConfig {
     double cutoff_scale      = 0.2;
     double cutoff_seq_bonus  = 4.0;
 
+    // --- Jack hand value ---
+    // Φ is board-only, so without these a jack in hand is worth nothing
+    // at a cutoff leaf, and the greedy rollout/prior (whose best two-eyed
+    // jack placement always scores ≥ any regular card's) spends jacks on
+    // the first positional gain — e.g. a two-eyed jack on move 1. Each
+    // held jack adds its value (Φ units) to the cutoff eval, and playing
+    // one subtracts the same value from its shaping score in the rollout
+    // policy and the PUCT prior. 0 = off (old behavior). SPRT at 8000
+    // iters, 3.0/1.5 vs 0/0: +26 Elo (95% CI +9..+44, 465 pairs).
+    double jack2_value       = 3.0;     // two-eyed (wild)
+    double jack1_value       = 1.5;     // one-eyed (remove)
+
     // --- Rollout policy ---
     // When true, the rollout policy will take a sequence-completing
     // move whenever one is available, overriding the ε-greedy choice.

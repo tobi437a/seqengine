@@ -130,6 +130,8 @@ PYBIND11_MODULE(_seqengine, m) {
         .def_readwrite("rollout_cutoff",          &MCTSConfig::rollout_cutoff)
         .def_readwrite("cutoff_scale",            &MCTSConfig::cutoff_scale)
         .def_readwrite("cutoff_seq_bonus",        &MCTSConfig::cutoff_seq_bonus)
+        .def_readwrite("jack2_value",             &MCTSConfig::jack2_value)
+        .def_readwrite("jack1_value",             &MCTSConfig::jack1_value)
         .def_readwrite("n_parallel_trees",        &MCTSConfig::n_parallel_trees)
         .def_readwrite("n_threads",               &MCTSConfig::n_threads)
         .def_readwrite("seed",                    &MCTSConfig::seed)

@@ -100,6 +100,20 @@ static int find_completing_move(GameState& s, const MoveList& moves, int player)
     return -1;
 }
 
+// Hand value of a jack, per cfg (0 for every other card).
+static inline double jack_value(const MCTSConfig& cfg, int card_type) {
+    if (card_type == TWO_EYED_JACK) return cfg.jack2_value;
+    if (card_type == ONE_EYED_JACK) return cfg.jack1_value;
+    return 0.0;
+}
+
+// Σ jack_value over p's hand.
+static double hand_jack_value(const MCTSConfig& cfg, const GameState& s, int p) {
+    double v = 0.0;
+    for (int i = 0; i < HAND_SIZE; ++i) v += jack_value(cfg, s.hands[p][i]);
+    return v;
+}
+
 static Move pick_rollout_move(GameState& s, const MoveList& moves,
                               Xoshiro256pp& rng, const MCTSConfig& cfg)
 {
@@ -138,7 +152,7 @@ static Move pick_rollout_move(GameState& s, const MoveList& moves,
             sc = 0.0;
         } else {
             int card_type = s.hands[player][m.card_idx];
-            sc = cache.score(card_type, m.cell);
+            sc = cache.score(card_type, m.cell) - jack_value(cfg, card_type);
         }
         if (sc > best_score) {
             best_score = sc;
@@ -184,7 +198,9 @@ static double rollout(GameState& state, Xoshiro256pp& rng,
     if (!state.done && cfg.rollout_cutoff > 0 && plies >= max_plies) {
         const double d = phi_diff_p0(state)
                        + cfg.cutoff_seq_bonus
-                         * double(state.sequences[0] - state.sequences[1]);
+                         * double(state.sequences[0] - state.sequences[1])
+                       + hand_jack_value(cfg, state, 0)
+                       - hand_jack_value(cfg, state, 1);
         return std::tanh(cfg.cutoff_scale * d);
     }
     double terminal = terminal_value_p0(state);   // ±1 or 0
@@ -439,7 +455,8 @@ static int ismcts_iteration(ISTree& tree, GameState state,
                 scores[i] = 0.0;
             } else {
                 int card_type = state.hands[player][m.card_idx];
-                scores[i] = prior_cache.score(card_type, m.cell);
+                scores[i] = prior_cache.score(card_type, m.cell)
+                          - jack_value(cfg, card_type);
             }
         }
         // Softmax (numerically stable: subtract max).
