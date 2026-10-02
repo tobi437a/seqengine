@@ -34,12 +34,10 @@ Python beyond the stdlib.
   1e-15, which is just IEEE round-off.
 - **Search:** Single-Observer Information-Set MCTS (Cowling, Powley &
   Whitehouse 2012) with AlphaZero-style PUCT: softmax shaping-score
-  priors, lazy expansion with FPU, and tree reuse across moves. One
-  tree per worker shared across iterations; each iteration
-  re-determinizes the opponent's hand. Tree nodes store moves only,
-  not states. The lazy-expansion + tree-reuse search beat the previous
-  width-first search by **+30 Elo** (SPRT at 800 iters/move, H1 ≥ 5 Elo
-  accepted; 95 % CI +17..+44 over 1,854 games). Against a uniform-
+  priors, lazy expansion with FPU, tree reuse across moves, truncated
+  rollouts, and a hand value for held jacks. One tree per worker shared
+  across iterations; each iteration re-determinizes the opponent's
+  hand. Tree nodes store moves only, not states. Against a uniform-
   random opponent it wins ~99 %; against the one-ply heuristic ~75 %
   at 2000 iters (200 games each), which grows with budget.
 - **Python bindings:** pybind11 module `_seqengine` with `MCTSConfig`
@@ -49,7 +47,7 @@ Python beyond the stdlib.
   opponents in this repo.
 - **Tests:** all C++ unit tests pass (sequence detection corner cases,
   1000-game random self-play soak, MCTS tactical win, MCTS self-play
-  smoke). The MCTS tests run against the current default (ISMCTS).
+  smoke).
 
 ## Layout
 
@@ -78,9 +76,8 @@ python/                    # End-user Python — fully self-contained
   game_engine.py           Reference Python engine (the rules implementation
                            we cross-validate the C++ eval against).
   seq_actions.py           action_to_int / int_to_action / get_legal_action_mask
-                           — extracted from the original rl_agent.py, no torch.
-  seq_opponents.py         random_action, heuristic_action — extracted from
-                           evaluate.py, no torch.
+                           (no torch dependency).
+  seq_opponents.py         random_action, heuristic_action (no torch dependency).
   mcts.py                  Python wrapper around the binding. MCTSOpponent
                            translates a SequenceGame to the primitive arrays
                            the C++ side expects, then returns an action_int
@@ -92,8 +89,8 @@ python/                    # End-user Python — fully self-contained
 
 tools/                     # Dev/CI utilities — not needed for end-user play
   build_config.py          Emits build-time config (ext_suffix, include
-                           flags, Python link line) cross-platform —
-                           replaces python3-config which is Unix-only.
+                           flags, Python link line) cross-platform, since
+                           python3-config is Unix-only.
   mkpath.py / rmpath.py    Cross-platform mkdir -p / rm -rf via Python,
                            used by the Makefile so it works on Windows.
   gen_board_data.py        Emits src/board_data.{hpp,cpp} from board_layout.py.
@@ -105,8 +102,7 @@ tools/                     # Dev/CI utilities — not needed for end-user play
   sprt.cpp                 In-process SPRT A/B between two MCTS configs —
                            paired games (same deal, swapped seats),
                            pentanomial GSPRT stopping rule. Used to gate
-                           search changes (e.g. lazy expansion + tree
-                           reuse) on a measured Elo gain.
+                           search changes on a measured Elo gain.
   ablation.cpp             Compares n_parallel_trees at fixed budget —
                            how much per-tree depth do extra workers cost?
   tune.cpp / mini_tune.cpp Hyperparameter sweeps.
@@ -127,7 +123,8 @@ make test        # build and run the C++ unit tests
 make validate    # cross-check src/eval.hpp against game_engine.py
 make bench       # microbenchmark eval + rollouts
 make compete     # 200-game match: MCTS vs random and MCTS vs heuristic
-make sprt        # SPRT A/B: dev (lazy expansion + tree reuse) vs legacy
+make sprt        # SPRT A/B between two MCTS configs; by default lazy
+                 # expansion + tree reuse vs both off
                  # (override flags: make sprt SPRT_ARGS="--tc ltc")
 make ablation    # n_parallel_trees ablation at fixed budget
 make tune        # full hyperparameter grid (slow)
@@ -149,21 +146,11 @@ From `make bench` on an 8-core / 16-thread dev box (16 threads, `-O3`):
 | Heuristic decision             | ~8.4M decisions/s   |
 | MCTS iterations (game-avg)     | ~808k iters/s       |
 
-The MCTS row went from ~336k to ~808k iters/s on the same box: ~1.45×
-from a cheaper, per-window-memoized `shaping_score` (bit-identical
-results — seeded games replay move-for-move), the rest from truncated
-rollouts (MCTS design §10).
-
 The MCTS row averages 1000-iter searches over 20 sampled mid-game
-positions. The initial position alone is ~2× slower because rollouts from an empty board are
-~2× longer.
-
-Note the MCTS row is ~13% slower per iteration than the legacy
-(pre-lazy-expansion) search: selection now computes shaping-score
-priors at every descent step instead of only at fully-expanded nodes.
-Each iteration buys more in exchange — deeper descents through reusable
-subtrees instead of width-first sweeps — and the trade nets out well
-ahead (SPRT: +30 Elo at a fixed iteration budget, see *MCTS design*).
+positions. The initial position alone is ~2× slower because rollouts
+from an empty board are ~2× longer. Most of the per-iteration speed
+comes from truncated rollouts (MCTS design §10) and a per-window-
+memoized `shaping_score`.
 
 ## Profiling
 
@@ -196,11 +183,10 @@ Reading this:
 - **The rollout policy is the bottleneck.** `pick_rollout_move` is 62 %
   of wall. That's the lever for any future "make MCTS faster" work —
   a value-network rollout would replace exactly this block.
-- **Selection got more expensive by design.** `MCTS::select_puct` rose
-  from ~2.5 % of wall (legacy) to ~11 %: lazy expansion runs prior-
-  weighted PUCT at every descent step instead of only at fully-expanded
-  nodes, and descents go deeper. That cost is what bought the +30 Elo
-  — see *MCTS design*.
+- **Selection is deliberately not free.** `MCTS::select_puct` is ~11 %
+  of wall because lazy expansion runs prior-weighted PUCT at every
+  descent step, and descents go deep through reused subtrees. See
+  *MCTS design* §7 for why that trade pays off.
 
 ## Using the engine from Python
 
@@ -253,9 +239,7 @@ per-iteration determinization:
    ISMCTS handles with per-child availability counts, folded into PUCT
    here. Ties are broken uniformly at random — without that, structural
    ties (e.g. dead-card declarations at winrate ≈ 1.0) accumulate
-   visits by move-generation order. The random tiebreak alone was the
-   biggest contributor to playing strength once the algorithm was
-   correct.
+   visits by move-generation order, which costs a lot of strength.
 
 3. **Robust-child final selection.** Argmax visits over root children
    (not argmax mean). Visit count is the more stable signal because it
@@ -272,20 +256,20 @@ per-iteration determinization:
    rollouts from being correlated through the game RNG.
 
 6. **Length-decay knob.** `cfg.length_decay` (default 1.0 = off) lets
-   you prefer fast wins / slow losses by setting it `< 1`. An earlier
-   ablation showed no overall winrate benefit, but it's useful for
-   tactical sanity tests where multiple winning continuations tie at
-   +1.0.
+   you prefer fast wins / slow losses by setting it `< 1`. It gives no
+   overall winrate benefit, but it's useful for tactical sanity tests
+   where multiple winning continuations tie at +1.0.
 
 7. **Lazy expansion with FPU.** (`cfg.lazy_expansion`, default ON.)
    Selection runs PUCT over *all* legal moves at a node: visited
    children use their empirical Q, unvisited moves use a first-play-
    urgency value of parent-Q − `cfg.fpu_reduction` (default 0.10), and
-   a node is only materialized when actually selected. The legacy mode
-   (OFF) force-expanded every untried legal move before PUCT could kick
-   in — at ~50 legal moves per node that burned most of a small
-   per-tree budget sweeping width-first. SPRT (lazy+reuse vs legacy,
-   800 iters, 927 pairs): **+30 Elo, 95% CI +17..+44**.
+   a node is only materialized when actually selected. With it OFF,
+   every untried legal move is force-expanded before PUCT kicks in — at
+   ~50 legal moves per node that burns most of a small per-tree budget
+   sweeping width-first. SPRT (lazy + reuse vs both off, 800 iters,
+   927 pairs): **+30 Elo, 95% CI +17..+44**, even though each
+   iteration is ~13 % slower.
 
 8. **Tree reuse across moves.** (`cfg.tree_reuse`, default ON.) The
    engine keeps its root-parallel forest between `suggest_move` calls.
@@ -293,9 +277,10 @@ per-iteration determinization:
    `MCTSEngine::advance(move)`; the next search re-roots every tree at
    the node matching the played path, carrying over subtree statistics.
    Any tree where the path has no node — and all trees when `advance`
-   was never called — resets to a fresh root, so harnesses that don't
-   call `advance` (e.g. the Python binding today) get exactly the old
-   search-from-scratch behavior.
+   was never called — resets to a fresh root, so a harness that doesn't
+   call `advance` simply searches from scratch every move. From Python,
+   call `MCTSOpponent.advance(action)` for every played move (`play.py`
+   does).
 
 9. **Root-parallel trees.** `cfg.n_parallel_trees` (default 8) builds
    N independent ISMCTS trees and aggregates their root-level visit
@@ -318,21 +303,34 @@ per-iteration determinization:
    at equal *iterations*, so the ~1.6× per-iteration speedup is on top.
    Not yet verified at 16k+ iterations.
 
-### What was tried and rejected
+11. **Jack hand value.** (`cfg.jack2_value` default 3.0, `cfg.jack1_value`
+   default 1.5, in Φ units; 0 = off.) Φ only scores the board, so
+   without this a jack in hand is worth nothing at a cutoff leaf, and
+   the greedy rollout/prior spends jacks on the first positional gain
+   (a two-eyed jack's best cell always scores ≥ any regular card's) —
+   e.g. a wild on move 1. Each held jack adds its value to the cutoff
+   eval, and playing one subtracts that value from its shaping score in
+   the rollout policy and the PUCT prior, so jacks get saved for
+   completing, blocking, and breaking sequences. SPRT vs 0/0 at 8000
+   iters: **+26 Elo** (465 pairs, CI +9..+44). Smaller values (1.0/0.5)
+   only help at low budgets; deeper searches still find an early wild
+   worth more than that.
+
+### Rejected alternatives
 
 - **γ-discounted sum of step rewards as rollout value** — variance
-  dominated signal. The dense reward signal sounds right in principle
-  but was strictly worse than terminal ±1 in head-to-head.
+  dominates signal. The dense reward signal sounds right in principle
+  but is strictly worse than terminal ±1 in head-to-head.
 - **Partial-credit terminal value** (terminal + α · Δseqs at end of
-  rollout) — similar story; marginal at best.
-- **Sequence-completion override in rollout policy** — the most
-  counter-intuitive result. Forcing both rollout players to grab obvious
+  rollout) — same problem; marginal at best.
+- **Sequence-completion override in rollout policy** — counter-
+  intuitively harmful. Forcing both rollout players to grab obvious
   sequences collapses rollouts into deterministic tempo races,
-  amplifying tiny differences. Kept as a config flag
-  (`prefer_completing_moves`, default OFF) but documented as harmful.
+  amplifying tiny differences. Available as a config flag
+  (`prefer_completing_moves`, default OFF).
 
-The pattern, repeated three times: in MCTS, lower-variance value
-estimates beat denser-but-noisier ones.
+The common thread: in MCTS, lower-variance value estimates beat
+denser-but-noisier ones.
 
 ## Other design notes
 
