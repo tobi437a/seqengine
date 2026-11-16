@@ -125,10 +125,10 @@ static MatchResult play_match(const MCTSConfig& base_cfg, OpponentFn opp_fn,
                 } else {
                     m = opp_fn(s, move_rng);
                 }
-                if (!s.make_move(m)) break;
-                // Tree reuse: tell MCTS what was actually played (its own
+                // Tree reuse: tell MCTS what is being played (its own
                 // move and the opponent's) so the next search re-roots.
-                mcts.advance(m);
+                mcts.advance(s, m);
+                if (!s.make_move(m)) break;
                 ++plies;
             }
             if (s.winner == mcts_seat)     r.wins++;
@@ -183,9 +183,8 @@ int main(int argc, char** argv) {
     Xoshiro256pp seed_rng(0xC0FFEEBEEF);
 
     std::printf("MCTS config: iterations=%d, ucb_c=%.2f, eps=%.2f, "
-                "trees=%d, determinize=%s\n",
+                "determinize=%s\n",
                 cfg.iterations, cfg.ucb_c, cfg.rollout_epsilon,
-                cfg.n_parallel_trees,
                 cfg.determinize ? "true" : "false");
     std::printf("Games per match: %d (alternating seats), %d parallel game workers\n\n",
                 n_games, COMPETE_WORKERS);

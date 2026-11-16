@@ -116,13 +116,16 @@ class MCTSOpponent:
 
     Configurable via kwargs that pass straight through to MCTSConfig:
         iterations               default 2000   total search budget
-        n_parallel_trees         default 8      root-parallel ISMCTS trees
-        n_threads                default 0      0 = auto (hardware_concurrency,
-                                                capped at min(16, n_parallel_trees))
+        n_threads                default 0      0 = auto (every hardware
+                                                thread; all search one tree)
         ucb_c                    default 2.0
         rollout_epsilon          default 0.30
         seed                     default 0      (0 → random_device)
     """
+
+    # Options from older versions that no longer exist. Accepted and
+    # ignored so existing callers keep working.
+    _RETIRED = ('n_parallel_trees', 'lazy_expansion', 'prefer_completing_moves')
 
     def __init__(self, **kwargs):
         cfg = _ext.MCTSConfig()
@@ -131,6 +134,8 @@ class MCTSOpponent:
         # keep tests/benchmarks deterministic.
         cfg.n_threads = 0
         for key, value in kwargs.items():
+            if key in self._RETIRED:
+                continue
             if not hasattr(cfg, key):
                 raise ValueError(f"unknown MCTSConfig option: {key}")
             setattr(cfg, key, value)
@@ -151,21 +156,21 @@ class MCTSOpponent:
         card_idx, row, col = self.engine.suggest_move(*args)
         return action_to_int(card_idx, row, col)
 
-    def advance(self, action):
+    def advance(self, action, card):
         """Report a move actually played in the game — by either side, in
-        the order played — so tree_reuse can re-root the kept search
-        forest at the next call instead of starting from scratch.
+        the order played — so tree_reuse can re-root the kept search tree
+        at the next call instead of starting from scratch.
 
-        Accepts a flat action int or a (card_idx, row, col) tuple;
-        row=col=-1 means a dead-card declaration. Optional: if never
-        called, every search starts from a fresh tree. Only report moves
-        whose card_idx is the true hand slot (a wrong slot can match the
-        wrong subtree); harnesses that don't track opponent slots should
-        simply not call this."""
+        `action` is a flat action int or a (card_idx, row, col) tuple;
+        row=col=-1 means a dead-card declaration. `card` is the card that
+        was played (a (suit, rank) tuple or a jack constant) — the tree
+        is keyed by card and cell, so the hand slot in `action` is not
+        used and may be anything. Optional: if never called, every search
+        starts from a fresh tree."""
         if not isinstance(action, (tuple, list)):
             action = int_to_action(int(action))
-        card_idx, row, col = action
-        self.engine.advance(int(card_idx), int(row), int(col))
+        _, row, col = action
+        self.engine.advance(card_to_int(card), int(row), int(col))
 
     @property
     def last_stats(self):

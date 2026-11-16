@@ -233,14 +233,13 @@ def apply_move(game, player, card, card_idx, row, col):
 
 # --- engine selection -----------------------------------------------------
 
-def try_load_mcts(iterations, n_parallel_trees=8):
+def try_load_mcts(iterations):
     """Returns (opponent, None) or (None, error message)."""
     try:
         from mcts import MCTSOpponent
     except Exception as e:
         return None, str(e)
-    return MCTSOpponent(iterations=iterations,
-                        n_parallel_trees=n_parallel_trees), None
+    return MCTSOpponent(iterations=iterations), None
 
 
 STRENGTHS = {

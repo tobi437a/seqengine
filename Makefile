@@ -1,7 +1,7 @@
 # Cross-platform Makefile for the Sequence engine.
 #
 # Targets:
-#   make            - build all C++ binaries (test, eval_dump, bench, compete, tune, ablation)
+#   make            - build all C++ binaries (test, eval_dump, bench, compete, tune, ablation, gen_data)
 #   make python     - build the pybind11 extension into python/ (needs pybind11)
 #   make test       - build and run the basic test harness
 #   make codegen    - regenerate src/board_data.{hpp,cpp} from python/board_layout.py
@@ -24,7 +24,16 @@ else
 endif
 
 CXX      ?= g++
-CXXFLAGS ?= -std=c++20 -O3 -Wall -Wextra -Wpedantic -Wno-missing-field-initializers -pthread
+# ARCH: build for the CPU we're compiling on. The engine is popcount-
+# heavy bitboard code, and without this g++ targets baseline x86-64,
+# which has no POPCNT instruction: every popcount becomes a bit-twiddling
+# routine and the search runs ~30% slower. The price is that the
+# binaries (including the .pyd/.so) only run on CPUs at least as new as
+# this one. To build something you can hand to another machine, use
+# `make ARCH=-march=x86-64-v2` (anything from ~2009 on, still has
+# POPCNT), or `make ARCH=` for fully generic code.
+ARCH     ?= -march=native
+CXXFLAGS ?= -std=c++20 -O3 $(ARCH) -Wall -Wextra -Wpedantic -Wno-missing-field-initializers -pthread
 BUILD    := build
 
 # Extra link flags for the pybind11 module. On Windows (MinGW/MSYS2) we
@@ -68,7 +77,8 @@ RM_RF   = $(PY) tools/rmpath.py
 ENGINE_SRCS := src/state.cpp src/board_data.cpp src/search.cpp
 ENGINE_OBJS := $(ENGINE_SRCS:%.cpp=$(BUILD)/%.o)
 ENGINE_HDRS := src/state.hpp src/types.hpp src/board_data.hpp \
-               src/eval.hpp src/rng.hpp src/search.hpp
+               src/eval.hpp src/rng.hpp src/search.hpp \
+               src/window_states.hpp src/learned_tables.hpp
 
 # Position-independent objects for the shared library backing the Python
 # binding. (PIC is a no-op on Windows but harmless.)
@@ -91,6 +101,10 @@ TUNE_BIN      := $(BUILD)/tune
 ABLATION_BIN  := $(BUILD)/ablation
 PROFILE_BIN   := $(BUILD)/profile
 SPRT_BIN      := $(BUILD)/sprt
+GEN_DATA_BIN  := $(BUILD)/gen_data
+
+# Where `make data` / `make fit` keep the self-play training data.
+DATA_DIR      ?= $(BUILD)/data
 
 # Python extension. EXT_SUFFIX is e.g. .cpython-312-x86_64-linux-gnu.so,
 # .cp312-win_amd64.pyd, .cpython-312-darwin.so — whatever the host Python
@@ -103,9 +117,9 @@ PY_MODULE     := python/_seqengine$(PY_EXT_SUFFIX)
 
 # --- targets ---------------------------------------------------------------
 
-.PHONY: all test codegen validate bench compete tune ablation profile sprt python pydeps clean
+.PHONY: all test codegen validate bench compete tune ablation profile sprt data fit python pydeps clean
 
-all: $(TEST_BIN) $(EVAL_DUMP_BIN) $(BENCH_BIN) $(COMPETE_BIN) $(TUNE_BIN) $(ABLATION_BIN)
+all: $(TEST_BIN) $(EVAL_DUMP_BIN) $(BENCH_BIN) $(COMPETE_BIN) $(TUNE_BIN) $(ABLATION_BIN) $(GEN_DATA_BIN)
 
 # Generic compile rule. $(@D) is GNU Make for "directory of the target".
 $(BUILD)/%.o: %.cpp $(ENGINE_HDRS)
@@ -151,6 +165,10 @@ $(ABLATION_BIN): tools/ablation.cpp $(ENGINE_OBJS) $(ENGINE_HDRS)
 $(SPRT_BIN): tools/sprt.cpp $(ENGINE_OBJS) $(ENGINE_HDRS)
 	@$(MKDIR_P) $(BUILD)
 	$(CXX) $(CXXFLAGS) -Isrc tools/sprt.cpp $(ENGINE_OBJS) -o $@
+
+$(GEN_DATA_BIN): tools/gen_data.cpp $(ENGINE_OBJS) $(ENGINE_HDRS)
+	@$(MKDIR_P) $(BUILD)
+	$(CXX) $(CXXFLAGS) -Isrc tools/gen_data.cpp $(ENGINE_OBJS) -o $@
 
 # Profile driver — built against the instrumented engine objects, so the
 # RAII timers in src/profile.hpp actually record. The driver itself is
@@ -204,6 +222,18 @@ ablation: $(ABLATION_BIN)
 
 sprt: $(SPRT_BIN)
 	./$(SPRT_BIN) $(SPRT_ARGS)
+
+# Re-learn the search's score/value tables from self-play:
+#   make data   plays engine-vs-engine games into $(DATA_DIR)
+#               (override: make data DATA_ARGS="4000 3000" for games, iters)
+#   make fit    fits src/learned_tables.hpp to them (needs numpy + torch);
+#               rebuild afterwards to use the new tables.
+data: $(GEN_DATA_BIN)
+	@$(MKDIR_P) $(DATA_DIR)
+	./$(GEN_DATA_BIN) $(DATA_DIR) $(DATA_ARGS)
+
+fit:
+	$(PY) tools/fit_tables.py $(DATA_DIR)
 
 # Play 5 full MCTS-vs-MCTS games with the profile instrumentation
 # active, then print a sorted breakdown of where time was spent and how

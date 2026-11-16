@@ -72,65 +72,71 @@ struct MCTSConfig {
     // the first positional gain — e.g. a two-eyed jack on move 1. Each
     // held jack adds its value (Φ units) to the cutoff eval, and playing
     // one subtracts the same value from its shaping score in the rollout
-    // policy and the PUCT prior. 0 = off (old behavior). SPRT at 8000
-    // iters, 3.0/1.5 vs 0/0: +26 Elo (95% CI +9..+44, 465 pairs).
+    // policy and the PUCT prior. 0 = off. SPRT at 8000 iters, 3.0/1.5
+    // vs 0/0: +26 Elo (95% CI +9..+44, 465 pairs).
     double jack2_value       = 3.0;     // two-eyed (wild)
     double jack1_value       = 1.5;     // one-eyed (remove)
 
-    // --- Rollout policy ---
-    // When true, the rollout policy will take a sequence-completing
-    // move whenever one is available, overriding the ε-greedy choice.
-    // Default OFF: ablation showed it actively hurt, because forcing
-    // both rollout players to grab obvious sequences makes rollouts
-    // collapse into deterministic tempo races that amplify tiny initial
-    // differences. Left as a feature flag for experimentation.
-    bool   prefer_completing_moves = false;
+    // --- Where the search's scoring departs from eval.hpp ---
+    // Each of these fixes something the shaping score / Φ get wrong for
+    // search purposes; turn one off to get the plain eval.hpp behavior
+    // back for an A/B.
+    //
+    // dead_windows: a new sequence may share at most one chip with an
+    //   existing one, so a window holding two or more of a player's
+    //   locked chips can never complete. Score it as zero for both sides
+    //   instead of as a live four/five.
+    // shaping_seq_bonus: added (Φ units) to a placement's score when it
+    //   completes a five. The shaping score alone gives that ≈ −0.03
+    //   (the 4 → 5 weights are equal), so rollout players would walk
+    //   past their own sequences. Hand-tuned scores only.
+    // random_ply_jacks: false = a random rollout ply picks among the
+    //   non-jack moves. A two-eyed jack contributes ~90 of ~105 legal
+    //   moves, so a uniformly random ply throws it away almost every
+    //   time one is in hand.
+    bool   dead_windows      = true;
+    double shaping_seq_bonus = 4.0;
+    bool   random_ply_jacks  = false;
 
-    // --- Lazy expansion (AlphaZero-style) ---
-    // When true, selection runs PUCT over ALL legal moves at a node —
-    // visited children use their empirical Q, unvisited moves use a
-    // first-play-urgency value of parent_q − fpu_reduction — and a node
-    // is only materialized when actually selected. When false (legacy),
-    // every untried legal move is force-expanded (uniformly at random)
-    // before PUCT selection kicks in, which at ~50 legal moves per node
-    // burns most of a small per-tree budget sweeping width-first.
-    bool   lazy_expansion    = true;
-    double fpu_reduction     = 0.10;    // unvisited Q = parent_q − this
+    // --- Learned tables ---
+    // Use the move-score / value tables fitted to the engine's own
+    // searches (src/learned_tables.hpp, tools/fit_tables.py) instead of
+    // the hand-set weights from eval.hpp. The learned move score also
+    // knows which cards the mover holds: a line they can keep extending
+    // from hand scores higher. With learned_policy the jack values and
+    // shaping_seq_bonus no longer affect move scores; with learned_value
+    // the cutoff_* and jack values no longer affect the leaf evaluation.
+    //
+    // Per iteration these are stronger than the hand-set tables (+23 Elo
+    // at 3000 iterations, +9 at 20000) but iterations take ~1.8x as long,
+    // because the sharper prior drives the tree deeper.
+    bool   learned_policy    = true;
+    bool   learned_value     = true;
+
+    // --- First-play urgency ---
+    // Selection runs PUCT over ALL legal moves at a node: visited
+    // children use their empirical Q, unvisited moves use parent_q −
+    // fpu_reduction, and a node is only materialized when selected.
+    double fpu_reduction     = 0.10;
 
     // --- Tree reuse across moves ---
-    // When true, the engine keeps its root-parallel forest between
-    // suggest_move calls. The harness reports every actually-played move
-    // via advance(); at the next suggest_move each tree is re-rooted at
-    // the child matching the played move path, carrying over the
-    // subtree's visit statistics. If a played move has no node (or
-    // advance() was never called), the tree resets to a fresh root, so
-    // harnesses that don't call advance() get exactly the old behavior.
+    // When true, the engine keeps its tree between suggest_move calls.
+    // The harness reports every actually-played move via advance(); at
+    // the next suggest_move the tree is re-rooted at the node reached by
+    // those moves, carrying over the subtree's statistics. If a played
+    // move has no node (or advance() was never called), the search
+    // starts from an empty root.
     bool   tree_reuse        = true;
 
     uint64_t seed            = 0;       // 0 → random_device
 
-    // --- Number of independent root-parallel trees ---
-    // Each tree is an independent ISMCTS search (own root, own RNG);
-    // every iteration within a tree re-determinizes the opponent's
-    // hand. We aggregate root visits across trees at the end. Since
-    // each tree already varies its determinization per iteration,
-    // running N trees doesn't add determinization diversity — it's
-    // purely a parallelism knob.
-    // n=1 → single-threaded one-tree search.
-    // n>1 → root-parallel; total budget is split as iterations/n per
-    //       tree. Trades per-tree depth for wall-clock speedup.
-    int      n_parallel_trees   = 8;
-
     // --- Parallelism ---
-    // Number of worker threads to distribute the n_parallel_trees trees
-    // across. Trees are independent (no shared state), so this gives
-    // near-linear scaling up to min(n_threads, n_parallel_trees) cores.
-    // Effective threads will be clamped to n_parallel_trees.
+    // Worker threads, all searching the one shared tree (lock-free, with
+    // virtual loss).
     //
-    //   n_threads = 1  : sequential (default; deterministic for tests).
-    //   n_threads = N  : spawn N threads via std::async.
-    //   n_threads = 0  : auto — std::thread::hardware_concurrency(),
-    //                    capped at min(n_parallel_trees, 16).
+    //   n_threads = 1  : sequential (default; deterministic given a seed).
+    //   n_threads = N  : N threads.
+    //   n_threads = 0  : auto — std::thread::hardware_concurrency().
     //
     // The Python wrapper (MCTSOpponent) defaults to n_threads=0 so
     // end-users get parallelism for free; the C++ default of 1 keeps
@@ -146,7 +152,17 @@ struct MCTSStats {
     int    best_move_visits   = 0;
     double best_move_winrate  = 0.0;   // mean value for the player to move
                                        // at root, mapped to [0, 1]
-    int    root_legal_moves   = 0;
+    double root_winrate       = 0.0;   // same, averaged over the whole search
+    int    root_legal_moves   = 0;     // distinct (card, target) moves
+    int    reused_visits      = 0;     // root visits carried over by tree reuse
+    int    threads            = 0;     // worker threads this search used
+};
+
+// One legal root move and what the last search thought of it.
+struct RootMoveStat {
+    Move   move;
+    int    visits  = 0;
+    double winrate = 0.0;      // mean value for the mover, mapped to [0, 1]
 };
 
 class MCTSEngine {
@@ -157,28 +173,48 @@ public:
     MCTSEngine& operator=(MCTSEngine&&) noexcept;
 
     // Choose a move for `s.current_player` to play. `s` is observed in
-    // full; if cfg.determinize, the opponent's hand and deck are
-    // resampled before search so we don't cheat on hidden info.
+    // full; if cfg.determinize, the opponent's hand and the deck are
+    // resampled every iteration so we don't cheat on hidden info.
     Move suggest_move(const GameState& s);
 
     // Tree reuse: report a move that was actually played in the game
-    // (by either side, in order). At the next suggest_move the kept
-    // forest is re-rooted along the reported path. Calling this is
-    // optional — if it's never called, every search starts fresh.
-    void advance(Move m);
+    // (by either side, in order). `before` is the state the move was
+    // played from — only the mover's card in slot m.card_idx is read.
+    // At the next suggest_move the kept tree is re-rooted along the
+    // reported moves. Optional — if it's never called, every search
+    // starts fresh.
+    void advance(const GameState& before, Move m);
+
+    // Same, for callers that know the card but not the hand slot (e.g.
+    // an opponent's move at a physical table). `card_type` is the 0..49
+    // card index; `cell` is the board cell, or Move::DEAD for a dead-
+    // card declaration.
+    void advance_card(int card_type, int cell);
 
     const MCTSStats& last_stats() const { return stats_; }
+
+    // Every legal move at the root of the last search with its visit
+    // count and mean value (unvisited moves included, with 0 visits).
+    // Empty if the last call didn't search (0 or 1 legal moves).
+    const std::vector<RootMoveStat>& last_root_moves() const { return root_moves_; }
     MCTSConfig&       config()           { return cfg_; }
     const MCTSConfig& config() const     { return cfg_; }
 
 private:
-    struct Forest;                      // persistent root-parallel trees
+    struct Tree;                        // persistent search tree
+    int prepare_tree(int budget);
 
     MCTSConfig    cfg_;
     Xoshiro256pp  rng_;
     MCTSStats     stats_;
-    std::unique_ptr<Forest> forest_;
-    std::vector<Move> pending_;         // moves played since last search
+    std::unique_ptr<Tree> tree_;
+    std::vector<uint16_t> pending_;     // keys of moves played since last search
+    std::vector<RootMoveStat> root_moves_;
 };
+
+// Test hook: plays `n_games` random games checking the search's internal
+// fast move generation / make-move / scoring against GameState and
+// eval.hpp. Returns the number of mismatches (0 = all consistent).
+int search_selfcheck(int n_games, uint64_t seed);
 
 } // namespace seq

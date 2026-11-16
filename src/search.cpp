@@ -1,597 +1,939 @@
 #include "search.hpp"
+#include "learned_tables.hpp"
 #include "profile.hpp"
+#include "window_states.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <functional>
-#include <future>
+#include <cstring>
+#include <limits>
 #include <random>
 #include <thread>
 
 namespace seq {
 
-// Outcome of a terminal state from player 0's perspective.
-static double terminal_value_p0(const GameState& s) {
-    if (s.winner == 0) return  1.0;
-    if (s.winner == 1) return -1.0;
-    return 0.0;
+namespace {
+
+// ---------------------------------------------------------------------------
+// Window-state tables
+// ---------------------------------------------------------------------------
+//
+// The search keeps, next to the bitboards, one byte per 5-window:
+//
+//     w = 72·dead + 36·j + 6·n0 + n1
+//
+// with n0/n1 the number of (non-joker) chips each player has in the
+// window, j = 1 if the window contains a joker corner, and dead = 1 once
+// the window can never become a sequence for anyone (see below).
+// Everything the search needs from the evaluation — the shaping score of
+// a placement or a removal, Φ, "did this just make five" — is a function
+// of that byte, so it is one table lookup per window instead of bitboard
+// ANDs and popcounts. A move touches the ≤ 20 windows through its cell.
+//
+// Scores are fixed-point integers (FP units per Φ point). Every weight
+// in eval.hpp is a multiple of 1e-4, so the integers are exact: equal
+// scores compare equal instead of differing in the last float bit.
+//
+// Dead windows: a new sequence may share at most one chip with an
+// existing one, so a window holding two or more of a player's locked
+// chips can never complete for that player — and it is blocked for the
+// opponent by those same chips. eval.hpp still scores such a window (the
+// finished sequence itself counts as a "5", the windows one step along
+// the line as "4"s), which rewards the opponent for "blocking" a line
+// that was never a threat. With cfg.dead_windows the search scores them
+// as zero for both sides.
+
+constexpr int FP        = 10000;
+constexpr int W_DEAD    = 72;
+constexpr int N_WSTATES = 144;
+
+// Board geometry in the compact form the hot loops want.
+struct Geometry {
+    uint8_t winit[N_WINDOWS];       // 36 if the window holds a joker
+    uint8_t cw[N_CELLS][MAX_WINDOWS_PER_CELL];   // windows through a cell
+    uint8_t cwn[N_CELLS];
+
+    Geometry() {
+        for (int w = 0; w < N_WINDOWS; ++w) {
+            winit[w] = (WINDOW_MASKS[w] & JOKER_MASK).any() ? 36 : 0;
+        }
+        for (int c = 0; c < N_CELLS; ++c) {
+            int k = 0;
+            for (; CELL_WINDOWS[c][k] >= 0; ++k) cw[c][k] = uint8_t(CELL_WINDOWS[c][k]);
+            cwn[c] = uint8_t(k);
+        }
+    }
+};
+
+const Geometry GEO;
+
+struct Tables {
+    // Move scores (fixed-point log-weights for the rollout policy and
+    // the prior), indexed by the mover's stage and seat.
+    // per window: place a chip — also by hand support (window_states.hpp);
+    // the hand-tuned table is the same at every support level
+    int32_t place[N_STAGES][2][N_HAND_LEVELS][N_WSTATES];
+    // 1 where the placement score actually depends on the support level,
+    // so the hot loop only works it out for those windows
+    uint8_t hand_sensitive[N_STAGES][2][N_WSTATES];
+    int32_t remove[N_STAGES][2][N_WSTATES];   // per window: remove opp chip
+    int32_t move_j2[N_STAGES];                // added when the move spends
+    int32_t move_j1[N_STAGES];                //   a two-/one-eyed jack
+    int32_t move_dead[N_STAGES];              // dead-card declaration
+
+    // Static value, player 0's view: tanh(value_scale · Σ), where Σ sums
+    // value[stage][w] over the windows plus the scalar terms below.
+    // `stage` here is player 0's stage.
+    int32_t value[N_STAGES][N_WSTATES];
+    int32_t value_j2[N_STAGES];               // per jack held, by holder's stage
+    int32_t value_j1[N_STAGES];
+    int32_t value_bias[N_STAGES];
+    int32_t value_tempo;                      // for the side to move
+    double  value_scale;
+
+    uint8_t five[2][N_WSTATES];     // window is five of player's (or joker)
+
+    explicit Tables(const MCTSConfig& cfg) {
+        std::memset(this, 0, sizeof(*this));
+
+        for (int idx = 0; idx < W_DEAD; ++idx) {    // dead states stay zero
+            const int j = idx / 36;
+            const int n[2] = {(idx % 36) / 6, idx % 6};
+            for (int p = 0; p < 2; ++p) {
+                five[p][idx] = (n[1 - p] == 0 && n[p] + j == 5);
+            }
+        }
+        if (cfg.learned_policy) fill_learned_policy();
+        else                    fill_handtuned_policy(cfg);
+        if (cfg.learned_value)  fill_learned_value();
+        else                    fill_handtuned_value(cfg);
+    }
+
+private:
+    static int32_t fp(double x) { return int32_t(std::llround(x * FP)); }
+
+    // eval.hpp's shaping score, as a per-window table.
+    void fill_handtuned_policy(const MCTSConfig& cfg) {
+        int32_t W[7], G[7];         // weight and γ·weight, fixed-point
+        for (int k = 0; k < 6; ++k) {
+            W[k] = fp(PHI_WINDOW_WEIGHTS[k]);
+            G[k] = fp(SHAPING_GAMMA * PHI_WINDOW_WEIGHTS[k]);
+        }
+        W[6] = W[5]; G[6] = G[5];   // unreachable counts; keep lookups in range
+        const int32_t seq_bonus = fp(cfg.shaping_seq_bonus);
+
+        for (int st = 0; st < N_STAGES; ++st) {
+            for (int idx = 0; idx < W_DEAD; ++idx) {
+                const int j = idx / 36;
+                const int n[2] = {(idx % 36) / 6, idx % 6};
+                for (int p = 0; p < 2; ++p) {
+                    const int me = n[p], opp = n[1 - p];
+                    const int pc = std::min(me + j, 5);     // my count incl. joker
+                    const int oc = std::min(opp + j, 5);
+                    // Placement (mirrors eval.hpp placement_window_term):
+                    //   γ·me_after − me_before + opp_before
+                    int32_t v = (opp == 0 ? G[pc + 1] - W[pc] : 0)
+                              + (me == 0 ? W[oc] : 0);
+                    // ... plus a bonus when the placement completes the five.
+                    if (opp == 0 && me + j == 4) v += seq_bonus;
+                    for (int h = 0; h < N_HAND_LEVELS; ++h) place[st][p][h][idx] = v;
+                    // Removal of one opp chip (mirrors removal_score):
+                    //   γ·me_after + opp_before − γ·opp_after
+                    remove[st][p][idx] = (opp == 1 ? G[pc] : 0)
+                        + ((me == 0 && opp >= 1) ? W[oc] - G[oc - 1] : 0);
+                }
+            }
+            move_j2[st]   = -fp(cfg.jack2_value);
+            move_j1[st]   = -fp(cfg.jack1_value);
+            move_dead[st] = 0;
+        }
+    }
+
+    // tanh(cutoff_scale · (Φ0 − Φ1 + seq bonus + jacks in hand)).
+    void fill_handtuned_value(const MCTSConfig& cfg) {
+        for (int st = 0; st < N_STAGES; ++st) {
+            for (int idx = 0; idx < W_DEAD; ++idx) {
+                const int j = idx / 36;
+                const int n0 = (idx % 36) / 6, n1 = idx % 6;
+                const int32_t phi0 = n1 == 0 ? fp(PHI_WINDOW_WEIGHTS[std::min(n0 + j, 5)]) : 0;
+                const int32_t phi1 = n0 == 0 ? fp(PHI_WINDOW_WEIGHTS[std::min(n1 + j, 5)]) : 0;
+                value[st][idx] = phi0 - phi1;
+            }
+            value_j2[st]   = fp(cfg.jack2_value);
+            value_j1[st]   = fp(cfg.jack1_value);
+            value_bias[st] = fp(cfg.cutoff_seq_bonus) * ((st >> 1) - (st & 1));
+        }
+        value_tempo = 0;
+        value_scale = cfg.cutoff_scale / FP;
+    }
+
+    // Tables fitted to the engine's own searches (tools/fit_tables.py).
+    void fill_learned_policy() {
+        for (int st = 0; st < N_STAGES; ++st) {
+            for (int idx = 0; idx < W_DEAD; ++idx) {
+                const int j = idx / 36;
+                const int n[2] = {(idx % 36) / 6, idx % 6};
+                for (int p = 0; p < 2; ++p) {
+                    const int id = window_state_id(j, n[p], n[1 - p]);
+                    if (id < 0) continue;
+                    for (int h = 0; h < N_HAND_LEVELS; ++h) {
+                        place[st][p][h][idx] = fp(LEARNED_PLACE[st][h][id]);
+                        if (place[st][p][h][idx] != place[st][p][0][idx]) {
+                            hand_sensitive[st][p][idx] = 1;
+                        }
+                    }
+                    remove[st][p][idx] = fp(LEARNED_REMOVE[st][id]);
+                }
+            }
+            move_j2[st]   = fp(LEARNED_MOVE_J2[st]);
+            move_j1[st]   = fp(LEARNED_MOVE_J1[st]);
+            move_dead[st] = fp(LEARNED_MOVE_DEAD[st]);
+        }
+    }
+
+    // logit P(player 0 wins) = U(0) − U(1) + tempo, with each player's U
+    // summed from their own stage's table; value = tanh(logit / 2).
+    void fill_learned_value() {
+        for (int st = 0; st < N_STAGES; ++st) {
+            const int st1 = 2 * (st & 1) + (st >> 1);      // player 1's stage
+            for (int idx = 0; idx < W_DEAD; ++idx) {
+                const int j = idx / 36;
+                const int n0 = (idx % 36) / 6, n1 = idx % 6;
+                const int id0 = window_state_id(j, n0, n1);
+                const int id1 = window_state_id(j, n1, n0);
+                if (id0 < 0) continue;
+                value[st][idx] = fp(LEARNED_VALUE[st][id0]) - fp(LEARNED_VALUE[st1][id1]);
+            }
+            value_j2[st]   = fp(LEARNED_VALUE_J2[st]);
+            value_j1[st]   = fp(LEARNED_VALUE_J1[st]);
+            value_bias[st] = fp(LEARNED_VALUE_SEQ) * ((st >> 1) - (st & 1));
+        }
+        value_tempo = fp(LEARNED_VALUE_TEMPO);
+        value_scale = 0.5 / FP;
+    }
+};
+
+// Per-search constants derived from the config.
+struct Params {
+    const MCTSConfig& cfg;
+    Tables   tb;
+    uint64_t eps_threshold;     // rollout ε as a 53-bit integer threshold
+    int      max_plies;
+    bool     use_vl;
+
+    Params(const MCTSConfig& c, bool multi_threaded)
+        : cfg(c),
+          tb(c),
+          eps_threshold(uint64_t(std::max(0.0, std::min(1.0, c.rollout_epsilon))
+                                 * double(uint64_t(1) << 53))),
+          max_plies(c.rollout_cutoff > 0
+                        ? std::min(c.rollout_cutoff, c.max_rollout_steps)
+                        : c.max_rollout_steps),
+          use_vl(multi_threaded) {}
+};
+
+// ---------------------------------------------------------------------------
+// Search state
+// ---------------------------------------------------------------------------
+
+struct SState {
+    GameState g;
+    uint8_t   w[N_WINDOWS];
+};
+
+// Flag the windows that hold two or more of `player`'s locked chips.
+void mark_dead_windows(SState& s, int player) {
+    const BB100 locked = s.g.locked[player];
+    for (int i = 0; i < N_WINDOWS; ++i) {
+        if (s.w[i] < W_DEAD && (WINDOW_MASKS[i] & locked).popcount() >= 2) {
+            s.w[i] = uint8_t(s.w[i] + W_DEAD);
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Determinization
-// ---------------------------------------------------------------------------
-//
-// From the engine's perspective the opponent's hand is "known" because
-// we hold a full GameState. To play fair on the hidden-info side, we
-// treat the opponent's hand as unknown: dump it back into the deck,
-// reshuffle the deck, deal HAND_SIZE fresh cards. The shuffle also
-// randomizes the deck order, which we'd otherwise be implicitly assuming.
-//
-// Called once per ISMCTS iteration on the iteration's local state copy,
-// so the search averages over many distinct guesses of the hidden info.
+void init_windows(SState& s, const Params& P) {
+    const BB100 b0 = s.g.chips[0] | s.g.locked[0];
+    const BB100 b1 = s.g.chips[1] | s.g.locked[1];
+    for (int i = 0; i < N_WINDOWS; ++i) {
+        const BB100 m = WINDOW_MASKS[i];
+        s.w[i] = uint8_t(GEO.winit[i] + 6 * (m & b0).popcount() + (m & b1).popcount());
+    }
+    if (P.cfg.dead_windows) {
+        mark_dead_windows(s, 0);
+        mark_dead_windows(s, 1);
+    }
+}
 
-static void determinize_opponent_hand(GameState& s, int our_player,
-                                      Xoshiro256pp& rng)
-{
+inline int32_t window_sum(const SState& s, const int32_t* table, int cell) {
+    const uint8_t* ws = GEO.cw[cell];
+    int32_t sum = 0;
+    for (int i = 0, n = GEO.cwn[cell]; i < n; ++i) sum += table[s.w[ws[i]]];
+    return sum;
+}
+
+// Placement score with hand support: each window through the cell reads
+// the table for how many of its other empty cells `support` covers.
+// `cache` (optional, 192 entries preset to -1) memoizes the per-window
+// support counts when many cells are scored against the same support —
+// a two-eyed jack's ~90 targets share most of their windows.
+inline int32_t window_sum_supported(const SState& s,
+                                    const int32_t (*table)[N_WSTATES],
+                                    const uint8_t* sensitive,
+                                    int cell, const BB100& support,
+                                    int8_t* cache) {
+    const int self = support.test(cell);    // the target itself doesn't count
+    const uint8_t* ws = GEO.cw[cell];
+    int32_t sum = 0;
+    for (int i = 0, n = GEO.cwn[cell]; i < n; ++i) {
+        const int w  = ws[i];
+        const int st = s.w[w];
+        int h = 0;
+        if (sensitive[st]) {
+            int c;
+            if (cache == nullptr) {
+                c = (WINDOW_MASKS[w] & support).popcount();
+            } else if ((c = cache[w]) < 0) {
+                c = (WINDOW_MASKS[w] & support).popcount();
+                cache[w] = int8_t(c);
+            }
+            h = std::min(c - self, N_HAND_LEVELS - 1);
+        }
+        sum += table[h][st];
+    }
+    return sum;
+}
+
+// Uniform integer in [0, n) — multiply-shift, no division.
+inline int rand_below(Xoshiro256pp& rng, int n) {
+    return int(((rng() >> 32) * uint64_t(n)) >> 32);
+}
+
+// Draw a uniformly random card from the deck. The search never looks at
+// deck order — it is hidden information — so instead of shuffling the
+// whole deck per determinization we pull a random card whenever one is
+// drawn. Same distribution, a fraction of the RNG calls.
+inline int8_t draw_random(GameState& g, Xoshiro256pp& rng) {
+    CardPile& d = g.deck;
+    if (d.count == 0) {
+        if (g.discard.count == 0) return -1;
+        d = g.discard;              // reshuffle the discard pile
+        g.discard.clear();
+    }
+    const int j = rand_below(rng, d.count);
+    const int8_t c = d.data[j];
+    d.data[j] = d.data[--d.count];
+    return c;
+}
+
+// The opponent's hand is hidden: return it to the deck and deal a fresh
+// random one. Called once per iteration on the iteration's state copy,
+// so the search averages over many guesses of the hidden cards.
+void determinize(SState& s, int our_player, Xoshiro256pp& rng) {
     SEQ_PROFILE_SCOPE("MCTS::determinize");
+    GameState& g = s.g;
     const int opp = 1 - our_player;
     for (int i = 0; i < HAND_SIZE; ++i) {
-        if (s.hands[opp][i] >= 0) {
-            s.deck.push_back(s.hands[opp][i]);
-            s.hands[opp][i] = -1;
+        if (g.hands[opp][i] >= 0) {
+            g.deck.push_back(g.hands[opp][i]);
+            g.hands[opp][i] = -1;
         }
     }
-    std::shuffle(s.deck.begin(), s.deck.end(), rng);
     for (int i = 0; i < HAND_SIZE; ++i) {
-        if (!s.deck.empty()) {
-            s.hands[opp][i] = s.deck.back();
-            s.deck.pop_back();
+        if (g.deck.count > 0) g.hands[opp][i] = draw_random(g, rng);
+    }
+}
+
+// GameState::make_move for moves that came out of gen_moves: no
+// validation, window bytes kept in sync, sequence detection only when a
+// window through the cell actually reached five.
+inline void apply_move(SState& s, const Params& P, Move m, Xoshiro256pp& rng) {
+    SEQ_PROFILE_SCOPE("MCTS::apply_move");
+    GameState& g = s.g;
+    const int p   = g.current_player;
+    const int opp = 1 - p;
+    const int8_t card = g.hands[p][m.card_idx];
+
+    if (m.is_dead()) {
+        g.discard.push_back(card);
+        g.hands[p][m.card_idx] = draw_random(g, rng);
+        g.dead_card_used[p] = true;
+        return;
+    }
+
+    const int cell = m.cell;
+    const uint8_t* ws = GEO.cw[cell];
+    const int n = GEO.cwn[cell];
+    if (card == ONE_EYED_JACK) {
+        g.chips[opp].reset(cell);
+        const uint8_t d = (p == 0) ? 1 : 6;      // one fewer opp chip
+        for (int i = 0; i < n; ++i) s.w[ws[i]] -= d;
+    } else {
+        g.chips[p].set(cell);
+        const uint8_t d = (p == 0) ? 6 : 1;
+        const uint8_t* five = P.tb.five[p];
+        unsigned made_five = 0;
+        for (int i = 0; i < n; ++i) made_five |= five[s.w[ws[i]] += d];
+        if (made_five) {
+            const int made = g.check_sequences(p, cell);
+            g.sequences[p] += made;
+            if (made > 0 && P.cfg.dead_windows) mark_dead_windows(s, p);
         }
     }
+
+    g.discard.push_back(card);
+    g.hands[p][m.card_idx] = draw_random(g, rng);
+
+    if (g.sequences[p] >= SEQUENCES_TO_WIN) {
+        g.done   = true;
+        g.winner = p;
+        return;
+    }
+    g.dead_card_used[p] = false;
+    g.current_player    = opp;
 }
 
 // ---------------------------------------------------------------------------
-// Rollout policy
+// Moves, as the search sees them
 // ---------------------------------------------------------------------------
 //
-// Three-tier policy, in priority order:
+// A tree edge is identified by WHAT was played, not by the hand slot it
+// was played from:
 //
-//   1. If cfg.prefer_completing_moves, scan for a move that completes a
-//      sequence (or wins). Take the first one found. This is the
-//      single biggest fix to the rollout's blindness, because the
-//      shaping score gives Δ = 0 for a 4-window → 5-window transition
-//      (WINDOW_WEIGHTS[4] == WINDOW_WEIGHTS[5] == 1.0).
-//   2. With probability ε, pick a uniformly random move (diversity —
-//      pure greedy collapses every rollout to the same trajectory).
-//   3. Otherwise, greedy on shaping score.
+//     regular card on cell c   key = c
+//     two-eyed jack on cell c  key = 128 + c
+//     one-eyed jack on cell c  key = 256 + c
+//     dead card of type t      key = 384 + t
 //
-// Tier 1's check is cheap: a placement at `cell` completes a sequence
-// iff some window through `cell` already had popcount-of-mine == 4 and
-// no opponent chips. We can verify without applying the move.
+// (The cell determines a regular card's type, so (kind, cell) is the
+// whole move.) Slots are an accident of hand order: the opponent's hand
+// is re-dealt every iteration, so slot-keyed edges would split one
+// opponent move over up to seven children, and two copies of a card in
+// our own hand would split one move over two. Card keys also mean the
+// board at a node is a function of the path alone.
 
-// Does placing `player`'s chip at `cell` complete a sequence?
-// (Pure read — does not mutate state.)
-static bool placement_completes_sequence(const GameState& s, int player, int cell) {
-    const int opp = 1 - player;
-    const BB100 mine_total = s.chips[player] | s.locked[player] | JOKER_MASK;
-    const BB100 opp_total  = s.chips[opp]    | s.locked[opp];
-    const int16_t* ws = CELL_WINDOWS[cell];
-    for (int i = 0; ws[i] >= 0; ++i) {
-        const BB100 w = WINDOW_MASKS[ws[i]];
-        if (!w.test(cell)) continue;             // (safety; CELL_WINDOWS only lists windows through cell)
-        if ((w & opp_total).any()) continue;     // blocked, can't form a sequence here
-        // cell is currently empty (move is a legal placement), so it isn't
-        // already in mine_total. If 4 are already there, adding cell makes 5.
-        if ((w & mine_total).popcount() == 4) return true;
-    }
-    return false;
+constexpr int KEY_J2   = 128;
+constexpr int KEY_J1   = 256;
+constexpr int KEY_DEAD = 384;
+constexpr int N_KEYS   = 512;
+
+inline uint16_t key_of(int card_type, int cell) {
+    if (cell < 0)                   return uint16_t(KEY_DEAD + card_type);
+    if (card_type == TWO_EYED_JACK) return uint16_t(KEY_J2 + cell);
+    if (card_type == ONE_EYED_JACK) return uint16_t(KEY_J1 + cell);
+    return uint16_t(cell);
 }
 
-// Returns -1 if no completing move is found.
-static int find_completing_move(GameState& s, const MoveList& moves, int player) {
-    for (int i = 0; i < moves.count; ++i) {
-        Move m = moves.moves[i];
-        if (m.is_dead()) continue;
-        int card_type = s.hands[player][m.card_idx];
-        if (card_type == ONE_EYED_JACK) continue;  // removes, doesn't place
-        if (placement_completes_sequence(s, player, m.cell)) return i;
+// Distinct moves: ≤ 96 jack targets (two-eyed on empty cells, one-eyed
+// on opponent chips — disjoint sets of non-joker cells) + 14 + 7.
+constexpr int MAX_SMOVES = 128;
+
+struct SMoveList {
+    int      n = 0;
+    Move     move[MAX_SMOVES];
+    uint16_t key[MAX_SMOVES];
+    int32_t  score[MAX_SMOVES];
+};
+
+// Legal moves for the side to move, one per distinct (card, target).
+// Mirrors GameState::legal_moves_for, including the dead-card allowance.
+// With `with_scores`, also fills each move's shaping score minus the
+// hand value of the jack it spends (dead-card declarations score 0).
+void gen_moves(const SState& s, const Params& P, SMoveList& out, bool with_scores) {
+    SEQ_PROFILE_SCOPE("MCTS::gen_moves");
+    const GameState& g = s.g;
+    const int p   = g.current_player;
+    const int opp = 1 - p;
+    const BB100 occupied = g.chips[0] | g.chips[1] | g.locked[0] | g.locked[1];
+    const int stage = stage_of(g.sequences[p], g.sequences[opp]);
+    const int32_t (*place_tb)[N_WSTATES] = P.tb.place[stage][p];
+    const int32_t* remove_tb = P.tb.remove[stage][p];
+
+    // Hand support (learned scores only): the empty cells each slot's
+    // regular card could fill.
+    const bool hand_aware = with_scores && P.cfg.learned_policy;
+    BB100 slot_cells[HAND_SIZE];
+    if (hand_aware) {
+        for (int i = 0; i < HAND_SIZE; ++i) {
+            const int c = g.hands[p][i];
+            if (c < 0 || c >= N_REGULAR_CARDS) continue;
+            for (int k = 0; k < 2; ++k) {
+                const int cc = CARD_TO_CELLS[c][k];
+                if (cc >= 0 && !occupied.test(cc)) slot_cells[i].set(cc);
+            }
+        }
     }
-    return -1;
-}
+    const uint8_t* sensitive = P.tb.hand_sensitive[stage][p];
+    // Score of placing on `cell` with the card in `slot`, whose support
+    // is every other slot's cells.
+    BB100  support;
+    int    support_slot = -1;
+    int8_t support_cache[N_WINDOWS];
+    auto place_score = [&](int slot, int cell, bool many_cells) -> int32_t {
+        if (!hand_aware) return window_sum(s, place_tb[0], cell);
+        if (slot != support_slot) {
+            support = BB100{};
+            for (int i = 0; i < HAND_SIZE; ++i) {
+                if (i != slot) support |= slot_cells[i];
+            }
+            support_slot = slot;
+            if (many_cells) std::memset(support_cache, -1, sizeof(support_cache));
+        }
+        if (support.empty()) return window_sum(s, place_tb[0], cell);
+        return window_sum_supported(s, place_tb, sensitive, cell, support,
+                                    many_cells ? support_cache : nullptr);
+    };
 
-// Hand value of a jack, per cfg (0 for every other card).
-static inline double jack_value(const MCTSConfig& cfg, int card_type) {
-    if (card_type == TWO_EYED_JACK) return cfg.jack2_value;
-    if (card_type == ONE_EYED_JACK) return cfg.jack1_value;
-    return 0.0;
-}
+    int n = 0;
+    uint64_t seen = 0;              // card types already handled
+    int dead_slot[HAND_SIZE];
+    int n_dead = 0;
 
-// Σ jack_value over p's hand.
-static double hand_jack_value(const MCTSConfig& cfg, const GameState& s, int p) {
-    double v = 0.0;
-    for (int i = 0; i < HAND_SIZE; ++i) v += jack_value(cfg, s.hands[p][i]);
-    return v;
-}
+    for (int slot = 0; slot < HAND_SIZE; ++slot) {
+        const int8_t card = g.hands[p][slot];
+        if (card < 0) continue;
+        const uint64_t bit = uint64_t(1) << card;
+        if (seen & bit) continue;
+        seen |= bit;
 
-static Move pick_rollout_move(GameState& s, const MoveList& moves,
-                              Xoshiro256pp& rng, const MCTSConfig& cfg)
-{
-    SEQ_PROFILE_SCOPE("MCTS::pick_rollout_move");
-    if (moves.count == 1) return moves.moves[0];
-
-    const int player = s.current_player;
-
-    // Tier 1: complete a sequence if we can.
-    if (cfg.prefer_completing_moves) {
-        int idx = find_completing_move(s, moves, player);
-        if (idx >= 0) return moves.moves[idx];
-    }
-
-    // Tier 2: ε random.
-    if (rng.rand_double() < cfg.rollout_epsilon) {
-        return moves.moves[rng.rand_int(0, moves.count - 1)];
-    }
-
-    // Tier 3: greedy on shaping. Dead-card declarations score 0 by
-    // definition, so they only get picked if no real move scores
-    // positive — useful as a "punt" when nothing helps.
-    //
-    // Cache by (flavor, cell): the loop is dominated by two-eyed-jack
-    // slots that all emit moves at the same set of empty cells, and
-    // duplicate hand slots otherwise revisit the same (flavor, cell)
-    // pairs. See ShapingCache for the full justification.
-    const ShapingMasks masks = build_shaping_masks(s, player);
-    ShapingCache cache(masks);
-    double best_score = -std::numeric_limits<double>::infinity();
-    int best_idx = 0;
-    for (int i = 0; i < moves.count; ++i) {
-        Move m = moves.moves[i];
-        double sc;
-        if (m.is_dead()) {
-            sc = 0.0;
+        const int before = n;
+        if (card == TWO_EYED_JACK) {
+            BB100 targets = ~occupied;
+            targets &= ~JOKER_MASK;
+            while (targets.any()) {
+                const int cell = targets.pop_lsb();
+                out.move[n] = Move{int8_t(slot), int8_t(cell)};
+                out.key[n]  = uint16_t(KEY_J2 + cell);
+                if (with_scores) out.score[n] = place_score(slot, cell, true) + P.tb.move_j2[stage];
+                ++n;
+            }
+        } else if (card == ONE_EYED_JACK) {
+            BB100 targets = g.chips[opp];
+            while (targets.any()) {
+                const int cell = targets.pop_lsb();
+                out.move[n] = Move{int8_t(slot), int8_t(cell)};
+                out.key[n]  = uint16_t(KEY_J1 + cell);
+                if (with_scores) out.score[n] = window_sum(s, remove_tb, cell) + P.tb.move_j1[stage];
+                ++n;
+            }
         } else {
-            int card_type = s.hands[player][m.card_idx];
-            sc = cache.score(card_type, m.cell) - jack_value(cfg, card_type);
+            for (int k = 0; k < 2; ++k) {
+                const int cell = CARD_TO_CELLS[card][k];
+                if (cell < 0 || occupied.test(cell)) continue;
+                out.move[n] = Move{int8_t(slot), int8_t(cell)};
+                out.key[n]  = uint16_t(cell);
+                if (with_scores) out.score[n] = place_score(slot, cell, false);
+                ++n;
+            }
         }
-        if (sc > best_score) {
-            best_score = sc;
-            best_idx   = i;
+        if (n == before) dead_slot[n_dead++] = slot;
+    }
+
+    if (n_dead > 0 && (!g.dead_card_used[p] || n == 0)) {
+        for (int i = 0; i < n_dead; ++i) {
+            const int slot = dead_slot[i];
+            out.move[n]  = Move{int8_t(slot), Move::DEAD};
+            out.key[n]   = uint16_t(KEY_DEAD + g.hands[p][slot]);
+            out.score[n] = P.tb.move_dead[stage];
+            ++n;
         }
     }
-    return moves.moves[best_idx];
+    out.n = n;
 }
 
 // ---------------------------------------------------------------------------
 // Rollout
 // ---------------------------------------------------------------------------
 //
-// Roll the position out to terminal (or truncation), then return
+// ε-greedy on the shaping score: with probability ε a uniformly random
+// move, otherwise the best-scoring one (first in generation order on
+// ties). Pure greedy would make every rollout from a state identical.
 //
-//     terminal_value × length_decay^plies
-//
-// where terminal_value is ±1 (or 0 if truncated). With decay=0.99 a
-// 1-ply win is +0.99, an 80-ply win is +0.45. This gives MCTS a clear
-// preference for fast wins / slow losses without the high variance of
-// summing per-step rewards (which an earlier ablation showed actively
-// hurt play — variance dominated signal in mid-budget searches).
-//
-// The decay also breaks the ties that pure ±1 produces between
-// "winning this move" and "winning eventually", which is what was
-// confusing MCTS at near-win positions.
+// A rollout that is still running after `rollout_cutoff` plies stops and
+// scores the position statically; one that reaches the end of the game
+// returns ±1 · length_decay^plies.
 
-static double rollout(GameState& state, Xoshiro256pp& rng,
-                      const MCTSConfig& cfg)
-{
+inline int32_t hand_jack_value(const Tables& tb, const GameState& g, int p) {
+    const int stage = stage_of(g.sequences[p], g.sequences[1 - p]);
+    int32_t v = 0;
+    for (int i = 0; i < HAND_SIZE; ++i) {
+        const int c = g.hands[p][i];
+        if (c == TWO_EYED_JACK)      v += tb.value_j2[stage];
+        else if (c == ONE_EYED_JACK) v += tb.value_j1[stage];
+    }
+    return v;
+}
+
+inline double terminal_value_p0(const GameState& g) {
+    if (g.winner == 0) return  1.0;
+    if (g.winner == 1) return -1.0;
+    return 0.0;
+}
+
+// Σ over the windows of the stage's value table (player 0's view).
+inline int32_t window_value_fp(const SState& s, const Params& P) {
+    const int32_t* tb = P.tb.value[stage_of(s.g.sequences[0], s.g.sequences[1])];
+    int32_t sum = 0;
+    for (int i = 0; i < N_WINDOWS; ++i) sum += tb[s.w[i]];
+    return sum;
+}
+
+double static_value_p0(const SState& s, const Params& P) {
+    const Tables& tb = P.tb;
+    const GameState& g = s.g;
+    const int32_t sum = window_value_fp(s, P)
+                      + tb.value_bias[stage_of(g.sequences[0], g.sequences[1])]
+                      + hand_jack_value(tb, g, 0)
+                      - hand_jack_value(tb, g, 1)
+                      + (g.current_player == 0 ? tb.value_tempo : -tb.value_tempo);
+    return std::tanh(tb.value_scale * double(sum));
+}
+
+double rollout(SState& s, Xoshiro256pp& rng, const Params& P) {
     SEQ_PROFILE_SCOPE("MCTS::rollout");
+    const MCTSConfig& cfg = P.cfg;
+    SMoveList L;
     int plies = 0;
-    MoveList moves;
-    const int max_plies = cfg.rollout_cutoff > 0
-        ? std::min(cfg.rollout_cutoff, cfg.max_rollout_steps)
-        : cfg.max_rollout_steps;
-    for (; plies < max_plies && !state.done; ++plies) {
-        state.legal_moves(moves);
-        if (moves.count == 0) break;
-        Move m = pick_rollout_move(state, moves, rng, cfg);
-        if (!state.make_move(m)) break;
-    }
-    if (!state.done && cfg.rollout_cutoff > 0 && plies >= max_plies) {
-        const double d = phi_diff_p0(state)
-                       + cfg.cutoff_seq_bonus
-                         * double(state.sequences[0] - state.sequences[1])
-                       + hand_jack_value(cfg, state, 0)
-                       - hand_jack_value(cfg, state, 1);
-        return std::tanh(cfg.cutoff_scale * d);
-    }
-    double terminal = terminal_value_p0(state);   // ±1 or 0
-    if (terminal == 0.0) return 0.0;              // truncated / draw
-    double decay = std::pow(cfg.length_decay, double(plies));
-    return terminal * decay;
-}
-
-// ---------------------------------------------------------------------------
-// ISMCTS — single-observer Information-Set MCTS
-// ---------------------------------------------------------------------------
-//
-// One tree shared across all iterations of a worker. Each iteration:
-//
-//   1. Determinize the opponent's hand and the deck order at the root.
-//   2. Walk the tree from the root, applying each chosen move to a
-//      live GameState copy. At each step:
-//        - Compute legal moves in the current determinization.
-//        - If any legal move has no matching child, expand one of those
-//          untried legal moves and proceed to rollout.
-//        - Else: compute a softmax prior over the legal children's
-//          shaping scores and pick the legal child maximizing PUCT
-//             Q(a) + c · P(a) · √Σ_b N(b) / (1 + N(a))
-//          where the sum runs over the currently-legal children only,
-//          so children that aren't legal in this determinization
-//          don't dilute the exploration bonus.
-//   3. Rollout from the leaf to terminal (or truncation).
-//   4. Backup visits + value along the descent path.
-//
-// Node memory is small (just the move + counts) because we don't store
-// state. The cost is that descent has to make moves on a live state.
-//
-// On ISMCTS + PUCT: with plain UCB1 the standard ISMCTS fix is a per-
-// child "availability count" so moves that are rarely legal aren't
-// unfairly punished for having few visits. PUCT folds that concern in
-// differently: the prior P(a) directly biases selection toward
-// plausible moves regardless of how often they've been legal, and the
-// exploration sum is over the currently-legal children only, so the
-// confidence bound a child accumulates is paced by how often it's
-// actually been in contention.
-
-// Pack a Move into a 16-bit key. Used to sort node children for binary-
-// search lookup during descent.
-//   card_idx ∈ [-1, HAND_SIZE)   (we only emit ≥ 0 in practice)
-//   cell     ∈ [-1, N_CELLS)
-// (+1 shifts keep keys non-negative; 128 > N_CELLS + 1 so the packing
-//  is one-to-one.)
-static inline uint16_t move_key(Move m) {
-    return uint16_t((int(m.card_idx) + 1) * 128 + (int(m.cell) + 1));
-}
-
-// One entry in a node's flat children list. 8 bytes per entry: tightly
-// packed so a binary search through hundreds of root children stays in
-// just a handful of cache lines.
-struct ChildEntry {
-    uint16_t key;       // move_key(move) — sorted, used as binary-search key
-    Move     move;      // 2 bytes (card_idx, cell)
-    int32_t  node_idx;  // index into ISTree::nodes
-};
-
-// ISMCTS tree node. No parent pointer — descent collects the path into
-// a local array and backup walks it. No std::unordered_map for children
-// — instead a flat std::vector<ChildEntry> kept sorted by move_key, so
-// lookups are a cache-friendly binary search and insertions are a
-// memmove on contiguous 8-byte entries.
-struct ISNode {
-    Move    move_from_parent{};
-    int     visits       = 0;
-    double  value_p0     = 0.0;
-    std::vector<ChildEntry> children;
-};
-
-// All nodes for one ISMCTS tree live in this arena (one std::vector per
-// tree). We reserve up-front so node indices remain stable for the
-// lifetime of the tree — every iteration expands at most one node, so
-// the upper bound is (1 root) + (per_tree iterations).
-struct ISTree {
-    std::vector<ISNode> nodes;
-
-    explicit ISTree(int budget_hint) {
-        nodes.reserve(size_t(budget_hint) + 2);
-        nodes.emplace_back();   // root at index 0
-    }
-    ISNode&       root()       { return nodes[0]; }
-    ISNode&       at(int32_t i)       { return nodes[i]; }
-    const ISNode& at(int32_t i) const { return nodes[i]; }
-};
-
-// Persistent root-parallel forest, kept across suggest_move calls so
-// trees can be re-rooted along the actually-played moves (tree reuse).
-struct MCTSEngine::Forest {
-    std::vector<ISTree> trees;
-};
-
-// Binary search by move_key. Returns the index into node.children whose
-// key equals `key`, or -1 if not found.
-static inline int find_child_slot(const ISNode& node, uint16_t key) {
-    int lo = 0, hi = int(node.children.size());
-    while (lo < hi) {
-        int mid = (lo + hi) >> 1;
-        uint16_t k = node.children[mid].key;
-        if (k < key)      lo = mid + 1;
-        else if (k > key) hi = mid;
-        else              return mid;
-    }
-    return -1;
-}
-
-// Returns the lowest index i such that node.children[i].key >= key.
-// Used to find the sorted-insertion point when adding a new child.
-static inline int lower_bound_slot(const ISNode& node, uint16_t key) {
-    int lo = 0, hi = int(node.children.size());
-    while (lo < hi) {
-        int mid = (lo + hi) >> 1;
-        if (node.children[mid].key < key) lo = mid + 1;
-        else                              hi = mid;
-    }
-    return lo;
-}
-
-// Reset a tree to a single fresh root.
-static void reset_tree(ISTree& tree) {
-    tree.nodes.clear();
-    tree.nodes.emplace_back();
-}
-
-// Re-root `tree` at the node reached by following `path` (the moves
-// actually played since the tree's root was current) and drop everything
-// outside that subtree. Returns false — leaving the tree to be reset by
-// the caller — if any move on the path has no child node, or if the
-// destination has no children worth carrying.
-static bool reroot_tree(ISTree& tree, const std::vector<Move>& path) {
-    int32_t idx = 0;
-    for (Move m : path) {
-        const ISNode& node = tree.at(idx);
-        int slot = find_child_slot(node, move_key(m));
-        if (slot < 0) return false;
-        idx = node.children[slot].node_idx;
-    }
-    if (tree.at(idx).children.empty()) return false;
-
-    // Compact the kept subtree into a fresh arena in BFS order,
-    // remapping child node indices as we go. Each node has exactly one
-    // parent, so every kept node is moved exactly once. (Indexed access
-    // throughout — out.push_back may not invalidate out[i] here because
-    // of the reserve, but don't hold references across it anyway.)
-    std::vector<ISNode> out;
-    out.reserve(tree.nodes.size());
-    out.push_back(std::move(tree.nodes[idx]));
-    for (size_t i = 0; i < out.size(); ++i) {
-        for (size_t k = 0; k < out[i].children.size(); ++k) {
-            int32_t old = out[i].children[k].node_idx;
-            out[i].children[k].node_idx = int32_t(out.size());
-            out.push_back(std::move(tree.nodes[old]));
+    for (; plies < P.max_plies && !s.g.done; ++plies) {
+        int pick = 0;
+        // Decide random-vs-greedy before generating, so a random ply
+        // skips scoring altogether.
+        const bool random_ply = (rng() >> 11) < P.eps_threshold;
+        gen_moves(s, P, L, !random_ply);
+        if (L.n == 0) break;
+        if (L.n > 1) {
+            if (random_ply) {
+                pick = rand_below(rng, L.n);
+                if (!cfg.random_ply_jacks) {
+                    // Don't let a random ply throw a jack away: choose
+                    // among the non-jack moves when there are any.
+                    int plain[MAX_SMOVES];
+                    int n_plain = 0;
+                    for (int i = 0; i < L.n; ++i) {
+                        if (L.key[i] < KEY_J2 || L.key[i] >= KEY_DEAD) plain[n_plain++] = i;
+                    }
+                    if (n_plain > 0) pick = plain[rand_below(rng, n_plain)];
+                }
+            } else {
+                int32_t best = L.score[0];
+                for (int i = 1; i < L.n; ++i) {
+                    if (L.score[i] > best) { best = L.score[i]; pick = i; }
+                }
+            }
         }
+        apply_move(s, P, L.move[pick], rng);
     }
-    out[0].move_from_parent = Move{};
-    tree.nodes = std::move(out);
-    return true;
+    if (!s.g.done && cfg.rollout_cutoff > 0 && plies >= P.max_plies) {
+        return static_value_p0(s, P);
+    }
+    const double terminal = terminal_value_p0(s.g);
+    if (terminal == 0.0 || cfg.length_decay == 1.0) return terminal;
+    return terminal * std::pow(cfg.length_decay, double(plies));
 }
 
-static int ismcts_iteration(ISTree& tree, GameState state,
-                            Xoshiro256pp& rng, const MCTSConfig& cfg)
+// ---------------------------------------------------------------------------
+// Tree
+// ---------------------------------------------------------------------------
+//
+// One tree, shared by every search thread, lock-free.
+//
+//   * Nodes live in a preallocated arena and are claimed with an atomic
+//     bump index; they are never freed or moved during a search.
+//   * A node's children form a singly linked list (first_child →
+//     next_sibling). A new child is prepended with a compare-and-swap on
+//     first_child, after its key and next_sibling are written, so a
+//     reader walking the list always sees fully-formed nodes. If two
+//     threads race to add the same move, the loser finds the winner's
+//     node in the entries that appeared ahead of it and uses that.
+//   * Statistics are atomics updated with relaxed fetch_add.
+//   * Virtual loss: while a thread is below a node, the node's `vl`
+//     counter makes it look like one extra lost visit to the others, so
+//     simultaneous descents spread out instead of piling onto one line.
+//     Single-threaded searches skip it.
+//
+// Index 0 is the root, and since the root is nobody's child, 0 doubles
+// as "none" for first_child / next_sibling — a zeroed arena is a valid
+// tree of one empty root.
+
+constexpr int64_t VAL_ONE = int64_t(1) << 24;   // fixed-point 1.0 for value sums
+
+struct Node {
+    std::atomic<int32_t> visits{0};
+    std::atomic<int32_t> vl{0};             // in-flight descents below here
+    std::atomic<int64_t> value{0};          // Σ value (player 0's view) · VAL_ONE
+    std::atomic<int32_t> first_child{0};
+    int32_t  next_sibling = 0;
+    uint16_t key = 0;
+};
+
+} // namespace
+
+struct MCTSEngine::Tree {
+    std::unique_ptr<Node[]> nodes;
+    int32_t                 capacity = 0;
+    std::atomic<int32_t>    used{0};
+
+    void allocate(int32_t cap) {
+        nodes.reset(new Node[size_t(cap)]());
+        capacity = cap;
+        used.store(1, std::memory_order_relaxed);    // the root
+    }
+};
+
+namespace {
+
+// Deepest path we track. A descent that somehow gets this deep just
+// rolls out from there.
+constexpr int MAX_PATH = 256;
+
+// One ISMCTS iteration: determinize, descend with PUCT (materializing at
+// most one new node), roll out, back up. Returns the depth reached.
+int iteration(Node* nodes, int32_t capacity, std::atomic<int32_t>& used,
+              SState s, Xoshiro256pp& rng, const Params& P)
 {
     SEQ_PROFILE_SCOPE("MCTS::ismcts_iteration");
+    const MCTSConfig& cfg = P.cfg;
 
-    // 1. Re-determinize at the root.
-    if (cfg.determinize) {
-        determinize_opponent_hand(state, state.current_player, rng);
-    }
+    if (cfg.determinize) determinize(s, s.g.current_player, rng);
 
-    // Path of node indices traversed this descent. Used for backup.
-    // Bounded by the max rollout depth in practice; MAX_MOVES is a
-    // comfortable upper bound that costs only a few KB on the stack.
-    int32_t path[MAX_MOVES];
+    int32_t path[MAX_PATH];
     int     path_len = 0;
-    path[path_len++] = 0;   // root
-
-    int     depth    = 0;
+    path[path_len++] = 0;
     int32_t node_idx = 0;
 
-    // 2. Selection + expansion.
-    while (!state.done) {
-        MoveList legal;
-        state.legal_moves(legal);
-        if (legal.count == 0) break;
-
-        // First pass: for each legal move, find its matching child (if
-        // any). We cache the result so the UCB pass below doesn't have
-        // to repeat the lookup.
-        int    child_slot[MAX_MOVES];   // index into node.children, or -1
-        int    untried[MAX_MOVES];      // legal-move indices with no child
-        int    n_untried = 0;
-        {
-            const ISNode& node = tree.at(node_idx);
-            for (int i = 0; i < legal.count; ++i) {
-                int slot = find_child_slot(node, move_key(legal.moves[i]));
-                child_slot[i] = slot;
-                if (slot < 0) untried[n_untried++] = i;
-            }
-        }
-
-        if (!cfg.lazy_expansion && n_untried > 0) {
-            SEQ_PROFILE_SCOPE("MCTS::expand");
-            // Legacy width-first expansion: expand a uniformly random
-            // untried legal move, then roll out.
-            int  pick = untried[rng.rand_int(0, n_untried - 1)];
-            Move m    = legal.moves[pick];
-            uint16_t k = move_key(m);
-
-            // Append a fresh node to the arena. The reserve in ISTree's
-            // ctor guarantees no reallocation, so existing indices stay
-            // valid. We bind `node` *after* the push_back to avoid a
-            // stale reference if the (already-reserved) vector grew.
-            int32_t new_idx = int32_t(tree.nodes.size());
-            tree.nodes.emplace_back();
-            tree.nodes.back().move_from_parent = m;
-
-            // Insert child entry in sorted position.
-            ISNode& node = tree.at(node_idx);
-            int    pos  = lower_bound_slot(node, k);
-            node.children.insert(node.children.begin() + pos,
-                                 ChildEntry{k, m, new_idx});
-
-            if (!state.make_move(m)) break;
-            node_idx = new_idx;
-            path[path_len++] = node_idx;
-            ++depth;
-            break;   // proceed to rollout from this fresh leaf
-        }
+    SMoveList L;
+    while (!s.g.done && path_len < MAX_PATH) {
+        gen_moves(s, P, L, true);
+        if (L.n == 0) break;
 
         SEQ_PROFILE_SCOPE("MCTS::select_puct");
+        const int player = s.g.current_player;
+        Node& node = nodes[node_idx];
 
-        // Compute a softmax prior over each legal move's shaping score,
-        // then pick the PUCT-best. (Legacy mode only reaches here once
-        // all legal moves have children; lazy mode scores unvisited
-        // moves with an FPU value and expands one only when selected.) Priors are recomputed per descent step because
-        // the player's hand (and thus the per-move shaping score)
-        // diverges across determinizations after a few plies.
-        // Ties broken uniformly at random — without this, dead-card
-        // declarations get expanded first (because legal_moves emits them
-        // last and untried popping was historically back-to-front) and
-        // accumulate visits whenever multiple moves tie at winrate ≈ 1.0.
-        const int player = state.current_player;
+        // Match existing children to this determinization's legal moves:
+        // mark the legal keys, then walk the child list once.
+        uint64_t legal_bits[N_KEYS / 64] = {};
+        uint8_t  idx_of_key[N_KEYS];
+        int32_t  child[MAX_SMOVES];
+        double   child_n[MAX_SMOVES];
+        double   child_q[MAX_SMOVES];       // mover's perspective
+        for (int i = 0; i < L.n; ++i) {
+            const uint16_t k = L.key[i];
+            legal_bits[k >> 6] |= uint64_t(1) << (k & 63);
+            idx_of_key[k] = uint8_t(i);
+            child[i] = 0;
+        }
 
-        const ShapingMasks prior_masks = build_shaping_masks(state, player);
-        ShapingCache prior_cache(prior_masks);
-        double scores[MAX_MOVES];
-        for (int i = 0; i < legal.count; ++i) {
-            Move m = legal.moves[i];
-            if (m.is_dead()) {
-                scores[i] = 0.0;
-            } else {
-                int card_type = state.hands[player][m.card_idx];
-                scores[i] = prior_cache.score(card_type, m.cell)
-                          - jack_value(cfg, card_type);
-            }
+        const int32_t head = node.first_child.load(std::memory_order_acquire);
+        const double  sign = (player == 0) ? 1.0 : -1.0;
+        double sum_visits = 0.0;
+        for (int32_t c = head; c != 0; c = nodes[c].next_sibling) {
+            const Node& cn = nodes[c];
+            const uint16_t k = cn.key;
+            if (!((legal_bits[k >> 6] >> (k & 63)) & 1)) continue;
+            const int i = idx_of_key[k];
+            const int32_t v  = cn.visits.load(std::memory_order_relaxed);
+            const int32_t vl = P.use_vl ? cn.vl.load(std::memory_order_relaxed) : 0;
+            const double  val = double(cn.value.load(std::memory_order_relaxed))
+                              * (1.0 / double(VAL_ONE));
+            const double  n = double(v + vl);
+            child[i]   = c;
+            child_n[i] = n;
+            // In-flight descents count as losses for the mover.
+            child_q[i] = (sign * val - double(vl)) / std::max(1.0, n);
+            sum_visits += n;
         }
-        // Softmax (numerically stable: subtract max).
-        double max_s = -std::numeric_limits<double>::infinity();
-        for (int i = 0; i < legal.count; ++i) {
-            if (scores[i] > max_s) max_s = scores[i];
-        }
+
+        // Softmax prior over the legal moves' scores.
+        int32_t max_s = L.score[0];
+        for (int i = 1; i < L.n; ++i) max_s = std::max(max_s, L.score[i]);
+        double prior[MAX_SMOVES];
         double sum_exp = 0.0;
-        double priors[MAX_MOVES];
-        for (int i = 0; i < legal.count; ++i) {
-            priors[i] = std::exp(scores[i] - max_s);
-            sum_exp += priors[i];
-        }
-        const double inv_sum_exp = 1.0 / sum_exp;
-
-        int32_t best_idx = -1;   // node index of the chosen child, -1 if unvisited
-        int     best_i   = -1;   // index into legal.moves
-        Move    best_move{};
-        double  best_score = -std::numeric_limits<double>::infinity();
-        int     n_tied = 0;
-
-        {
-            ISNode& node = tree.at(node_idx);
-
-            // Σ_b N(s,b) over the currently-legal children. In legacy
-            // mode every legal move has been expanded by the time we
-            // reach this branch, so sum_visits ≥ legal.count ≥ 1. In
-            // lazy mode unvisited moves contribute 0.
-            double sum_visits = 0.0;
-            for (int i = 0; i < legal.count; ++i) {
-                if (child_slot[i] >= 0) {
-                    sum_visits += double(
-                        tree.at(node.children[child_slot[i]].node_idx).visits);
-                }
-            }
-            // Lazy mode adds +1 under the √ so the very first selection
-            // at a node follows the prior instead of tying at explore=0.
-            const double sqrt_sum = cfg.lazy_expansion
-                ? std::sqrt(sum_visits + 1.0)
-                : std::sqrt(sum_visits);
-
-            // First-play urgency (lazy mode): unvisited moves score the
-            // node's own mean from the mover's perspective minus a small
-            // reduction, so they compete on prior + optimism instead of
-            // being force-expanded width-first.
-            double fpu_q = 0.0;
-            if (cfg.lazy_expansion) {
-                double parent_mean_p0 =
-                    node.visits > 0 ? node.value_p0 / node.visits : 0.0;
-                double parent_q = (player == 0) ? parent_mean_p0
-                                                : -parent_mean_p0;
-                fpu_q = parent_q - cfg.fpu_reduction;
-            }
-
-            for (int i = 0; i < legal.count; ++i) {
-                double  q, nvis;
-                int32_t ci = -1;
-                if (child_slot[i] >= 0) {
-                    ChildEntry& ce = node.children[child_slot[i]];
-                    ISNode& c = tree.at(ce.node_idx);
-                    double mean_p0 = c.value_p0 / std::max(1, c.visits);
-                    q    = (player == 0) ? mean_p0 : -mean_p0;
-                    nvis = double(c.visits);
-                    ci   = ce.node_idx;
-                } else {
-                    q    = fpu_q;
-                    nvis = 0.0;
-                }
-                double prior   = priors[i] * inv_sum_exp;
-                double explore = cfg.ucb_c * prior * sqrt_sum
-                                 / (1.0 + nvis);
-                double score   = q + explore;
-
-                if (score > best_score + 1e-12) {
-                    best_score = score;
-                    best_idx   = ci;
-                    best_i     = i;
-                    best_move  = legal.moves[i];
-                    n_tied     = 1;
-                } else if (score > best_score - 1e-12) {
-                    ++n_tied;
-                    if (rng.rand_int(0, n_tied - 1) == 0) {
-                        best_idx  = ci;
-                        best_i    = i;
-                        best_move = legal.moves[i];
-                    }
-                }
-            }
+        for (int i = 0; i < L.n; ++i) {
+            prior[i] = std::exp(double(L.score[i] - max_s) * (1.0 / FP));
+            sum_exp += prior[i];
         }
 
-        if (best_i < 0) break;                         // pathological
+        // First-play urgency: an unvisited move is worth the node's own
+        // mean (mover's view) minus a small reduction. The +1 under the
+        // root lets the very first selection at a node follow the prior.
+        const int32_t nv = node.visits.load(std::memory_order_relaxed);
+        const double parent_q = nv > 0
+            ? sign * double(node.value.load(std::memory_order_relaxed))
+                   / (double(VAL_ONE) * double(nv))
+            : 0.0;
+        const double fpu_q   = parent_q - cfg.fpu_reduction;
+        const double explore = cfg.ucb_c * std::sqrt(sum_visits + 1.0) / sum_exp;
 
-        if (best_idx < 0) {
-            // Lazy expansion: the selected move has no node yet —
-            // materialize it now, then roll out from the fresh leaf.
+        int    best_i = -1;
+        double best_score = -std::numeric_limits<double>::infinity();
+        int    n_tied = 0;
+        for (int i = 0; i < L.n; ++i) {
+            double q, n;
+            if (child[i] != 0 && child_n[i] > 0.0) { q = child_q[i]; n = child_n[i]; }
+            else                                   { q = fpu_q;      n = 0.0; }
+            const double score = q + explore * prior[i] / (1.0 + n);
+            if (score > best_score + 1e-12) {
+                best_score = score;
+                best_i     = i;
+                n_tied     = 1;
+            } else if (score > best_score - 1e-12) {
+                // Uniform among ties (reservoir) — without it structural
+                // ties resolve by generation order.
+                ++n_tied;
+                if (rand_below(rng, n_tied) == 0) best_i = i;
+            }
+        }
+        if (best_i < 0) break;
+
+        int32_t next = child[best_i];
+        const bool expanded = (next == 0);
+        if (expanded) {
             SEQ_PROFILE_SCOPE("MCTS::expand");
-            uint16_t k = move_key(best_move);
-            int32_t new_idx = int32_t(tree.nodes.size());
-            tree.nodes.emplace_back();
-            tree.nodes.back().move_from_parent = best_move;
-
-            ISNode& node = tree.at(node_idx);
-            int pos = lower_bound_slot(node, k);
-            node.children.insert(node.children.begin() + pos,
-                                 ChildEntry{k, best_move, new_idx});
-
-            if (!state.make_move(best_move)) break;
-            node_idx = new_idx;
-            path[path_len++] = node_idx;
-            ++depth;
-            break;   // proceed to rollout from this fresh leaf
+            const uint16_t key = L.key[best_i];
+            const int32_t fresh = used.fetch_add(1, std::memory_order_relaxed);
+            if (fresh >= capacity) {
+                // Arena exhausted (cannot happen with the sizing in
+                // suggest_move, but stay safe): roll out without a node.
+                apply_move(s, P, L.move[best_i], rng);
+                break;
+            }
+            nodes[fresh].key = key;
+            next = fresh;
+            int32_t scanned = head;      // list entries we've already checked
+            int32_t expect  = head;
+            for (;;) {
+                nodes[fresh].next_sibling = expect;
+                if (node.first_child.compare_exchange_weak(
+                        expect, fresh,
+                        std::memory_order_release, std::memory_order_acquire)) {
+                    break;
+                }
+                // Someone prepended since we looked. If one of the new
+                // entries is this same move, use it and abandon ours.
+                int32_t found = 0;
+                for (int32_t x = expect; x != scanned; x = nodes[x].next_sibling) {
+                    if (nodes[x].key == key) { found = x; break; }
+                }
+                if (found != 0) { next = found; break; }
+                scanned = expect;
+            }
         }
 
-        if (!state.make_move(best_move)) break;
-        node_idx = best_idx;
+        apply_move(s, P, L.move[best_i], rng);
+        if (P.use_vl) nodes[next].vl.fetch_add(1, std::memory_order_relaxed);
+        node_idx = next;
         path[path_len++] = node_idx;
-        ++depth;
+        if (expanded) break;             // roll out from the fresh leaf
     }
 
-    // 3. Rollout from the leaf (or use terminal value if state.done).
-    double value_p0 = state.done
-        ? terminal_value_p0(state)
-        : rollout(state, rng, cfg);
+    const double value_p0 = s.g.done ? terminal_value_p0(s.g)
+                                     : rollout(s, rng, P);
 
-    // 4. Backup along the descent path.
     {
         SEQ_PROFILE_SCOPE("MCTS::backup");
+        const int64_t v = std::llround(value_p0 * double(VAL_ONE));
         for (int i = 0; i < path_len; ++i) {
-            ISNode& n = tree.at(path[i]);
-            n.visits   += 1;
-            n.value_p0 += value_p0;
+            Node& n = nodes[path[i]];
+            n.value.fetch_add(v, std::memory_order_relaxed);
+            n.visits.fetch_add(1, std::memory_order_relaxed);
+            if (P.use_vl && i > 0) n.vl.fetch_sub(1, std::memory_order_relaxed);
         }
     }
+    return path_len - 1;
+}
 
-    return depth;
+inline int32_t find_child(const Node* nodes, int32_t parent, uint16_t key) {
+    for (int32_t c = nodes[parent].first_child.load(std::memory_order_relaxed);
+         c != 0; c = nodes[c].next_sibling) {
+        if (nodes[c].key == key) return c;
+    }
+    return 0;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Self-check
+// ---------------------------------------------------------------------------
+//
+// The search has its own fast copies of things that live elsewhere: move
+// generation and make_move (state.cpp) and the shaping score and Φ
+// (eval.hpp). This plays random games and checks, at every ply, that
+// the fast versions agree with the reference ones.
+
+int search_selfcheck(int n_games, uint64_t seed) {
+    int bad = 0;
+    Xoshiro256pp rng(seed);
+    MCTSConfig cfg;             // reference scoring: eval.hpp, nothing added
+    cfg.dead_windows        = false;
+    cfg.shaping_seq_bonus   = 0.0;
+    cfg.learned_policy      = false;
+    cfg.learned_value       = false;
+    const Params P(cfg, false);
+
+    for (int game = 0; game < n_games; ++game) {
+        GameState ref;
+        ref.reset(rng());
+        SState inc;                 // window bytes maintained incrementally
+        inc.g = ref;
+        init_windows(inc, P);
+
+        for (int ply = 0; ply < 2000 && !ref.done; ++ply) {
+            // Window bytes: incremental == recomputed from the bitboards.
+            SState chk;
+            chk.g = ref;
+            init_windows(chk, P);
+            if (std::memcmp(chk.w, inc.w, sizeof(chk.w)) != 0) ++bad;
+
+            // Move generation: same set of moves as GameState's.
+            MoveList ml;
+            ref.legal_moves(ml);
+            SMoveList sl;
+            gen_moves(inc, P, sl, true);
+            if (sl.n != ml.count) ++bad;
+            const int p = ref.current_player;
+            for (int i = 0; i < sl.n && i < ml.count; ++i) {
+                bool found = false;
+                for (int k = 0; k < ml.count; ++k) found |= (ml.moves[k] == sl.move[i]);
+                if (!found) ++bad;
+
+                // Scores: fixed-point == eval.hpp's doubles.
+                const Move m = sl.move[i];
+                const int card = ref.hands[p][m.card_idx];
+                if (sl.key[i] != key_of(card, m.cell)) ++bad;
+                double want = 0.0;
+                if (!m.is_dead()) {
+                    want = shaping_score(ref, p, card, m.cell);
+                    if (card == TWO_EYED_JACK) want -= cfg.jack2_value;
+                    if (card == ONE_EYED_JACK) want -= cfg.jack1_value;
+                }
+                if (std::fabs(want - double(sl.score[i]) / FP) > 1e-9) ++bad;
+            }
+
+            // Φ difference.
+            if (std::fabs(double(window_value_fp(inc, P)) / FP - phi_diff_p0(ref)) > 1e-9) ++bad;
+
+            if (ml.count == 0) break;
+            const Move m = ml.moves[rand_below(rng, ml.count)];
+
+            // apply_move vs make_move: same board, sequences and turn.
+            // (Draws differ by design — the search draws at random — so
+            // hands and piles are re-synced from the reference state.)
+            apply_move(inc, P, m, rng);
+            if (!ref.make_move(m)) { ++bad; break; }
+            for (int q = 0; q < 2; ++q) {
+                if (inc.g.chips[q] != ref.chips[q] || inc.g.locked[q] != ref.locked[q]
+                    || inc.g.sequences[q] != ref.sequences[q]
+                    || inc.g.dead_card_used[q] != ref.dead_card_used[q]) ++bad;
+            }
+            if (inc.g.current_player != ref.current_player || inc.g.done != ref.done
+                || inc.g.winner != ref.winner) ++bad;
+            inc.g = ref;
+        }
+    }
+    return bad;
 }
 
 // ---------------------------------------------------------------------------
@@ -608,280 +950,194 @@ MCTSEngine::MCTSEngine(MCTSConfig cfg) : cfg_(cfg) {
     }
 }
 
-// Out-of-line where Forest is complete.
+// Out-of-line where Tree is complete.
 MCTSEngine::~MCTSEngine() = default;
 MCTSEngine::MCTSEngine(MCTSEngine&&) noexcept = default;
 MCTSEngine& MCTSEngine::operator=(MCTSEngine&&) noexcept = default;
 
-void MCTSEngine::advance(Move m) {
-    if (!cfg_.tree_reuse) return;
-    pending_.push_back(m);
+void MCTSEngine::advance(const GameState& before, Move m) {
+    if (m.card_idx < 0 || m.card_idx >= HAND_SIZE) return;
+    advance_card(before.hands[before.current_player][m.card_idx], m.cell);
 }
 
-// Run `budget` iterations on one ISMCTS tree and append its root-level
-// visit counts to the aggregator vectors. Each iteration re-determinizes
-// the opponent's hand and deck; multiple trees per call are purely a
-// parallelism knob (each tree builds independently and we aggregate at
-// the end). The tree is owned by the caller: fresh after reset_tree, or
-// carrying a re-rooted subtree from the previous move (tree reuse).
-struct PerTreeStats { int iterations; int max_depth; };
-
-static PerTreeStats run_one_tree(const GameState& s_in,
-                                 Xoshiro256pp& rng,
-                                 const MCTSConfig& cfg,
-                                 int budget,
-                                 ISTree& tree,
-                                 std::vector<int>& root_visits,
-                                 std::vector<double>& root_value_p0,
-                                 std::vector<Move>& root_moves)
-{
-    int max_depth  = 0;
-    int iters_done = 0;
-
-    // Every iteration expands at most one node; reserving up-front keeps
-    // node indices valid across the emplace_backs inside the iteration.
-    tree.nodes.reserve(tree.nodes.size() + size_t(budget) + 2);
-    for (int i = 0; i < budget; ++i) {
-        int d = ismcts_iteration(tree, s_in, rng, cfg);
-        if (d > max_depth) max_depth = d;
-        ++iters_done;
+void MCTSEngine::advance_card(int card_type, int cell) {
+    if (!cfg_.tree_reuse) return;
+    if (card_type < 0 || card_type >= N_CARD_TYPES || cell >= N_CELLS) {
+        // Not a move we can follow: forget the tree.
+        tree_.reset();
+        pending_.clear();
+        return;
     }
+    pending_.push_back(key_of(card_type, cell));
+}
 
-    // Aggregate root-level visit counts into the caller's accumulators.
-    // Moves are matched on (card_idx, cell) — workers see the same legal
-    // moves at root since the player's own hand is fixed; only the
-    // opponent's hand and deck order differ across determinizations.
-    const ISNode& root = tree.root();
-    for (const ChildEntry& ce : root.children) {
-        const ISNode& child = tree.at(ce.node_idx);
-        Move m = ce.move;
-        int idx = -1;
-        for (size_t k = 0; k < root_moves.size(); ++k) {
-            if (root_moves[k].card_idx == m.card_idx &&
-                root_moves[k].cell     == m.cell) {
-                idx = int(k); break;
+// Get the tree ready for a search of `budget` iterations: re-root it
+// along the moves played since the last search (keeping that subtree's
+// statistics), or start from an empty root if there is nothing to keep.
+// Returns the number of visits carried over at the new root.
+int MCTSEngine::prepare_tree(int budget) {
+    const int32_t slack = 64;       // nodes lost to expansion races
+    std::vector<int32_t> order;     // kept nodes (old indices), BFS order
+
+    if (cfg_.tree_reuse && tree_ && !pending_.empty()) {
+        const Node* old = tree_->nodes.get();
+        int32_t idx = 0;
+        for (uint16_t key : pending_) {
+            idx = find_child(old, idx, key);
+            if (idx == 0) break;
+        }
+        if (idx != 0 && old[idx].first_child.load(std::memory_order_relaxed) != 0) {
+            order.push_back(idx);
+            for (size_t i = 0; i < order.size(); ++i) {
+                for (int32_t c = old[order[i]].first_child.load(std::memory_order_relaxed);
+                     c != 0; c = old[c].next_sibling) {
+                    order.push_back(c);
+                }
             }
         }
-        if (idx < 0) {
-            root_moves.push_back(m);
-            root_visits.push_back(child.visits);
-            root_value_p0.push_back(child.value_p0);
-        } else {
-            root_visits[idx]   += child.visits;
-            root_value_p0[idx] += child.value_p0;
+    }
+    pending_.clear();
+
+    auto fresh = std::make_unique<Tree>();
+    fresh->allocate(int32_t(order.size()) + budget + slack);
+    int carried = 0;
+    if (!order.empty()) {
+        // Copy in BFS order: a node's children land contiguously, in
+        // their old list order, so the child lists stay intact and
+        // siblings end up adjacent in memory.
+        const Node* old = tree_->nodes.get();
+        Node* nn = fresh->nodes.get();
+        int32_t next = 1;
+        for (size_t i = 0; i < order.size(); ++i) {
+            const Node& o = old[order[i]];
+            Node& n = nn[i];
+            n.visits.store(o.visits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            n.value.store(o.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            n.key = (i == 0) ? uint16_t(0) : o.key;
+            int32_t first = 0, prev = 0;
+            for (int32_t c = o.first_child.load(std::memory_order_relaxed);
+                 c != 0; c = old[c].next_sibling) {
+                const int32_t ci = next++;
+                if (first == 0) first = ci; else nn[prev].next_sibling = ci;
+                prev = ci;
+            }
+            n.first_child.store(first, std::memory_order_relaxed);
         }
+        fresh->used.store(int32_t(order.size()), std::memory_order_relaxed);
+        carried = nn[0].visits.load(std::memory_order_relaxed);
     }
-
-    return {iters_done, max_depth};
-}
-
-// One worker's slice of the root-parallel aggregation: visit counts,
-// summed rollout values, and the moves they refer to. Each worker
-// thread fills its own instance; we merge them sequentially on the
-// calling thread after all workers complete. Merging is O(W·M·K) where
-// W=workers, M=root moves, K=children seen per tree — tiny compared to
-// rollouts.
-struct WorkerResult {
-    std::vector<int>    visits;
-    std::vector<double> value_p0;
-    std::vector<Move>   moves;
-    int                 iterations = 0;
-    int                 max_depth  = 0;
-};
-
-// Given an initial state and a seed, run `per_tree` iterations on each
-// of the `n_trees` trees in the caller-owned slice and return their
-// aggregated root-move statistics. Workers operate on disjoint tree
-// slices of the persistent forest — no shared state, no locks; safe to
-// call concurrently on independent slices.
-//
-// The function builds its own RNG from the given seed, so worker threads
-// are reproducible from (seed, config) alone.
-static WorkerResult run_worker(const GameState& s_in,
-                               const MCTSConfig& cfg,
-                               ISTree* trees,
-                               int n_trees,
-                               int per_tree,
-                               uint64_t seed)
-{
-    Xoshiro256pp rng(seed);
-    WorkerResult r;
-    for (int t = 0; t < n_trees; ++t) {
-        auto pt = run_one_tree(s_in, rng, cfg, per_tree, trees[t],
-                               r.visits, r.value_p0, r.moves);
-        r.iterations += pt.iterations;
-        if (pt.max_depth > r.max_depth) r.max_depth = pt.max_depth;
-    }
-    return r;
-}
-
-// Determine the effective worker count and the per-worker tree split.
-// Returns a vector of (n_trees_for_this_worker) sized to the number of
-// workers we'll actually spawn. If n_threads is auto (0) we cap at 16;
-// otherwise we honor the request, clamped to [1, n_total_trees].
-static std::vector<int> partition_trees(int n_total_trees, int n_threads_cfg) {
-    int n_threads;
-    if (n_threads_cfg <= 0) {
-        unsigned hc = std::thread::hardware_concurrency();
-        if (hc == 0) hc = 1;
-        n_threads = std::min<int>(int(hc), 16);
-    } else {
-        n_threads = n_threads_cfg;
-    }
-    n_threads = std::max(1, std::min(n_threads, n_total_trees));
-
-    // Distribute n_total_trees trees across n_threads workers as evenly
-    // as possible. Extra trees go to the first few workers.
-    std::vector<int> sizes(n_threads, n_total_trees / n_threads);
-    int leftover = n_total_trees % n_threads;
-    for (int i = 0; i < leftover; ++i) sizes[i]++;
-    return sizes;
+    tree_ = std::move(fresh);
+    return carried;
 }
 
 Move MCTSEngine::suggest_move(const GameState& s_in) {
     SEQ_PROFILE_SCOPE("MCTS::suggest_move");
     using clk = std::chrono::high_resolution_clock;
-    auto t0 = clk::now();
+    const auto t0 = clk::now();
 
     stats_ = {};
+    root_moves_.clear();
 
-    // Quick edge cases — read off the un-determinized state since our
-    // own legal moves don't depend on the opponent's hand.
-    {
-        MoveList ms;
-        GameState peek = s_in;
-        peek.legal_moves(ms);
-        stats_.root_legal_moves = ms.count;
-        if (ms.count == 0) { stats_.best_move = Move{}; return Move{}; }
-        if (ms.count == 1) {
-            Move only = ms.moves[0];
-            stats_.best_move        = only;
-            stats_.best_move_visits = 1;
-            stats_.iterations       = 0;
-            stats_.seconds = std::chrono::duration<double>(clk::now() - t0).count();
-            return only;
+    // Worker count: explicit, or every hardware thread; never more
+    // threads than there is work for.
+    int n_threads = cfg_.n_threads;
+    if (n_threads <= 0) {
+        const unsigned hc = std::thread::hardware_concurrency();
+        n_threads = hc == 0 ? 1 : int(hc);
+    }
+    const int budget = std::max(1, cfg_.iterations);
+    n_threads = std::max(1, std::min({n_threads, 64, budget / 64 + 1}));
+
+    const Params P(cfg_, n_threads > 1);
+
+    SState root;
+    root.g = s_in;
+    init_windows(root, P);
+
+    // Our own legal moves don't depend on the opponent's hand, so read
+    // them off the un-determinized state.
+    SMoveList root_moves;
+    gen_moves(root, P, root_moves, false);
+    stats_.root_legal_moves = root_moves.n;
+    if (root_moves.n == 0) { stats_.best_move = Move{}; return Move{}; }
+    if (root_moves.n == 1) {
+        stats_.best_move        = root_moves.move[0];
+        stats_.best_move_visits = 1;
+        stats_.seconds = std::chrono::duration<double>(clk::now() - t0).count();
+        return stats_.best_move;
+    }
+
+    stats_.reused_visits = prepare_tree(budget);
+    Tree& tree = *tree_;
+    Node* nodes = tree.nodes.get();
+
+    std::atomic<int> claimed{0};
+    auto work = [&](uint64_t seed, int* max_depth) {
+        Xoshiro256pp rng(seed);
+        int deepest = 0;
+        while (claimed.fetch_add(1, std::memory_order_relaxed) < budget) {
+            const int d = iteration(nodes, tree.capacity, tree.used, root, rng, P);
+            if (d > deepest) deepest = d;
         }
-    }
+        *max_depth = deepest;
+    };
 
-    // Split the iteration budget across n root-parallel trees. With
-    // ISMCTS each tree already re-determinizes per iteration, so extra
-    // trees are purely for parallelism.
-    int n_trees  = std::max(1, cfg_.n_parallel_trees);
-    int per_tree = std::max(1, cfg_.iterations / n_trees);
-
-    // Prepare the persistent forest. If tree reuse is on and the harness
-    // reported the moves played since the last search (via advance()),
-    // re-root each tree along that path, carrying its subtree statistics
-    // over. Any tree where the path dies — and every tree when there's
-    // no pending path (advance() never called, or first search) — resets
-    // to a fresh root, which reproduces the old search-from-scratch
-    // behavior exactly.
-    if (!forest_) forest_ = std::make_unique<Forest>();
-    Forest& forest = *forest_;
-    const bool try_reuse = cfg_.tree_reuse && !pending_.empty()
-                        && int(forest.trees.size()) == n_trees;
-    if (int(forest.trees.size()) != n_trees) {
-        forest.trees.clear();
-        forest.trees.reserve(size_t(n_trees));
-        for (int t = 0; t < n_trees; ++t) forest.trees.emplace_back(per_tree);
-    }
-    for (auto& tree : forest.trees) {
-        if (!(try_reuse && reroot_tree(tree, pending_))) reset_tree(tree);
-    }
-    pending_.clear();
-
-    // Decide how many threads to use and how many trees each handles.
-    // Pre-generate a seed for each worker from the engine RNG, then
-    // hand off — workers don't share rng_. Each worker gets a disjoint
-    // contiguous slice of the forest's trees.
-    auto split = partition_trees(n_trees, cfg_.n_threads);
-    std::vector<uint64_t> seeds(split.size());
+    std::vector<uint64_t> seeds(static_cast<size_t>(n_threads));
     for (auto& s : seeds) s = rng_();
-
-    std::vector<WorkerResult> results(split.size());
-
-    if (split.size() == 1) {
-        // Sequential fast path — no async overhead.
-        results[0] = run_worker(s_in, cfg_, forest.trees.data(),
-                                split[0], per_tree, seeds[0]);
+    std::vector<int> depths(static_cast<size_t>(n_threads), 0);
+    if (n_threads == 1) {
+        work(seeds[0], &depths[0]);
     } else {
-        // Parallel path — std::async with explicit launch::async so each
-        // task actually gets a fresh thread (deferred would serialize).
-        std::vector<std::future<WorkerResult>> futures;
-        futures.reserve(split.size());
-        int tree_off = 0;
-        for (size_t i = 0; i < split.size(); ++i) {
-            futures.push_back(std::async(std::launch::async,
-                                         run_worker, std::cref(s_in),
-                                         std::cref(cfg_),
-                                         forest.trees.data() + tree_off,
-                                         split[i], per_tree, seeds[i]));
-            tree_off += split[i];
+        std::vector<std::thread> threads;
+        threads.reserve(size_t(n_threads) - 1);
+        for (int t = 1; t < n_threads; ++t) {
+            threads.emplace_back(work, seeds[size_t(t)], &depths[size_t(t)]);
         }
-        for (size_t i = 0; i < futures.size(); ++i) {
-            results[i] = futures[i].get();
-        }
+        work(seeds[0], &depths[0]);
+        for (auto& th : threads) th.join();
+    }
+    // Racing threads can over-claim arena slots; clamp for the next reroot.
+    if (tree.used.load(std::memory_order_relaxed) > tree.capacity) {
+        tree.used.store(tree.capacity, std::memory_order_relaxed);
     }
 
-    // Merge all worker results into a single (moves, visits, value_p0).
-    std::vector<int>    root_visits;
-    std::vector<double> root_value_p0;
-    std::vector<Move>   root_moves;
-    int total_iters = 0;
-    int max_depth   = 0;
-
-    for (const auto& r : results) {
-        total_iters += r.iterations;
-        if (r.max_depth > max_depth) max_depth = r.max_depth;
-        for (size_t i = 0; i < r.moves.size(); ++i) {
-            Move m = r.moves[i];
-            int idx = -1;
-            for (size_t k = 0; k < root_moves.size(); ++k) {
-                if (root_moves[k].card_idx == m.card_idx &&
-                    root_moves[k].cell     == m.cell) {
-                    idx = int(k);
-                    break;
-                }
-            }
-            if (idx < 0) {
-                root_moves.push_back(m);
-                root_visits.push_back(r.visits[i]);
-                root_value_p0.push_back(r.value_p0[i]);
-            } else {
-                root_visits[idx]   += r.visits[i];
-                root_value_p0[idx] += r.value_p0[i];
-            }
-        }
-    }
-
-    // Pick the move with the most aggregate visits; ties broken at
-    // random so we don't have a structural bias toward whatever move
-    // legal_moves emits first.
-    int best_idx = 0;
-    int best_v   = root_visits[0];
-    int n_tied   = 1;
-    for (size_t i = 1; i < root_visits.size(); ++i) {
-        if (root_visits[i] > best_v) {
-            best_v   = root_visits[i];
-            best_idx = int(i);
-            n_tied   = 1;
-        } else if (root_visits[i] == best_v) {
+    // Robust child: the legal root move with the most visits, ties
+    // broken at random.
+    const double sign = (s_in.current_player == 0) ? 1.0 : -1.0;
+    int     best_i = 0, n_tied = 0;
+    int32_t best_v = -1;
+    root_moves_.reserve(size_t(root_moves.n));
+    for (int i = 0; i < root_moves.n; ++i) {
+        const int32_t c = find_child(nodes, 0, root_moves.key[i]);
+        const int32_t v = c ? nodes[c].visits.load(std::memory_order_relaxed) : 0;
+        const double mean = v > 0
+            ? sign * double(nodes[c].value.load(std::memory_order_relaxed))
+                   / (double(VAL_ONE) * double(v))
+            : 0.0;
+        root_moves_.push_back(RootMoveStat{
+            root_moves.move[i], v, 0.5 * (std::max(-1.0, std::min(1.0, mean)) + 1.0)});
+        if (v > best_v) {
+            best_v = v; best_i = i; n_tied = 1;
+        } else if (v == best_v) {
             ++n_tied;
-            if (rng_.rand_int(0, n_tied - 1) == 0) best_idx = int(i);
+            if (rng_.rand_int(0, n_tied - 1) == 0) best_i = i;
         }
     }
 
-    // Aggregate mean value of the chosen move, P0 perspective.
-    double mean_p0 = root_value_p0[best_idx] / std::max(1, root_visits[best_idx]);
-    int player     = s_in.current_player;
-    double q_for_player = (player == 0) ? mean_p0 : -mean_p0;
-    double q_clipped    = std::max(-1.0, std::min(1.0, q_for_player));
-
-    stats_.iterations         = total_iters;
-    stats_.max_depth          = max_depth;
-    stats_.best_move          = root_moves[best_idx];
-    stats_.best_move_visits   = best_v;
-    stats_.best_move_winrate  = 0.5 * (q_clipped + 1.0);
+    stats_.iterations        = budget;
+    stats_.max_depth         = *std::max_element(depths.begin(), depths.end());
+    stats_.best_move         = root_moves.move[best_i];
+    stats_.best_move_visits  = best_v;
+    stats_.best_move_winrate = root_moves_[size_t(best_i)].winrate;
+    {
+        const int32_t rv = nodes[0].visits.load(std::memory_order_relaxed);
+        const double mean = rv > 0
+            ? sign * double(nodes[0].value.load(std::memory_order_relaxed))
+                   / (double(VAL_ONE) * double(rv))
+            : 0.0;
+        stats_.root_winrate = 0.5 * (std::max(-1.0, std::min(1.0, mean)) + 1.0);
+    }
+    stats_.threads           = n_threads;
     stats_.seconds = std::chrono::duration<double>(clk::now() - t0).count();
     return stats_.best_move;
 }

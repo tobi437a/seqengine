@@ -12,7 +12,7 @@
 // single games and an Elo point estimate + 95% normal-approx CI.
 //
 // In-process A/B: both configs run in the same binary. Useful for
-// tuning hyperparameters (ucb_c, rollout_epsilon, iterations, trees).
+// tuning hyperparameters (ucb_c, rollout_epsilon, iterations, ...).
 // For testing code changes between revisions, build a separate binary
 // at each revision and drive them externally — that's out of scope here.
 //
@@ -54,12 +54,9 @@ struct Args {
     double   dev_ucb_c     = 2.0;
     double   base_eps      = 0.30;
     double   dev_eps       = 0.30;
-    int      base_trees    = 8;
-    int      dev_trees     = 8;
-    // Defaults A/B the new search features: base = legacy behavior,
-    // dev = lazy expansion + tree reuse.
-    int      base_lazy     = 0;
-    int      dev_lazy      = 1;
+    double   base_fpu      = 0.10;
+    double   dev_fpu       = 0.10;
+    // Default A/B: tree reuse off (base) vs on (dev).
     int      base_reuse    = 0;
     int      dev_reuse     = 1;
     // Truncated rollouts (0 = play to terminal) and their static eval.
@@ -90,8 +87,7 @@ struct Args {
         "  --base-iters N --dev-iters N   per-side iteration budgets\n"
         "  --base-ucb-c X --dev-ucb-c X   PUCT exploration constant\n"
         "  --base-eps X   --dev-eps X     epsilon for epsilon-greedy rollouts\n"
-        "  --base-trees N --dev-trees N   number of root-parallel trees\n"
-        "  --base-lazy 0|1 --dev-lazy 0|1   lazy expansion + FPU (default base=0 dev=1)\n"
+        "  --base-fpu X   --dev-fpu X     first-play-urgency reduction (default 0.10)\n"
         "  --base-reuse 0|1 --dev-reuse 0|1 tree reuse across moves (default base=0 dev=1)\n"
         "  --base-cutoff N --dev-cutoff N   rollout truncation in plies (default 12; 0 = full rollouts)\n"
         "  --base-cscale X --dev-cscale X   tanh scale of the cutoff eval (default 0.2)\n"
@@ -133,10 +129,8 @@ static Args parse_args(int argc, char** argv) {
         else if (f == "--dev-ucb-c")    a.dev_ucb_c    = std::atof(need(i, f.c_str()));
         else if (f == "--base-eps")     a.base_eps     = std::atof(need(i, f.c_str()));
         else if (f == "--dev-eps")      a.dev_eps      = std::atof(need(i, f.c_str()));
-        else if (f == "--base-trees")   a.base_trees   = std::atoi(need(i, f.c_str()));
-        else if (f == "--dev-trees")    a.dev_trees    = std::atoi(need(i, f.c_str()));
-        else if (f == "--base-lazy")    a.base_lazy    = std::atoi(need(i, f.c_str()));
-        else if (f == "--dev-lazy")     a.dev_lazy     = std::atoi(need(i, f.c_str()));
+        else if (f == "--base-fpu")     a.base_fpu     = std::atof(need(i, f.c_str()));
+        else if (f == "--dev-fpu")      a.dev_fpu      = std::atof(need(i, f.c_str()));
         else if (f == "--base-reuse")   a.base_reuse   = std::atoi(need(i, f.c_str()));
         else if (f == "--dev-reuse")    a.dev_reuse    = std::atoi(need(i, f.c_str()));
         else if (f == "--base-cutoff")  a.base_cutoff  = std::atoi(need(i, f.c_str()));
@@ -180,11 +174,11 @@ static int play_one_game(const MCTSConfig& base_cfg, const MCTSConfig& dev_cfg,
         Move m = (s.current_player == dev_seat)
                     ? dev_eng.suggest_move(s)
                     : base_eng.suggest_move(s);
-        if (!s.make_move(m)) break;
         // Report every played move to both engines so tree reuse can
         // re-root at the next search (no-op when tree_reuse is off).
-        base_eng.advance(m);
-        dev_eng.advance(m);
+        base_eng.advance(s, m);
+        dev_eng.advance(s, m);
+        if (!s.make_move(m)) break;
         ++plies;
     }
     if (s.winner == -1)        return 0;
@@ -285,12 +279,10 @@ static SprtReport compute(const SprtState& st, double elo0, double elo1,
 // --- output ----------------------------------------------------------------
 
 static void print_header(const Args& a) {
-    std::printf("SPRT: base [iters=%d ucb_c=%.2f eps=%.2f trees=%d lazy=%d reuse=%d]"
-                "  vs  dev [iters=%d ucb_c=%.2f eps=%.2f trees=%d lazy=%d reuse=%d]\n",
-                a.base_iters, a.base_ucb_c, a.base_eps, a.base_trees,
-                a.base_lazy, a.base_reuse,
-                a.dev_iters,  a.dev_ucb_c,  a.dev_eps,  a.dev_trees,
-                a.dev_lazy, a.dev_reuse);
+    std::printf("SPRT: base [iters=%d ucb_c=%.2f eps=%.2f fpu=%.2f reuse=%d]"
+                "  vs  dev [iters=%d ucb_c=%.2f eps=%.2f fpu=%.2f reuse=%d]\n",
+                a.base_iters, a.base_ucb_c, a.base_eps, a.base_fpu, a.base_reuse,
+                a.dev_iters,  a.dev_ucb_c,  a.dev_eps,  a.dev_fpu,  a.dev_reuse);
     std::printf("      base [cutoff=%d cscale=%.2f cbonus=%.2f]  vs  dev [cutoff=%d cscale=%.2f cbonus=%.2f]\n",
                 a.base_cutoff, a.base_cscale, a.base_cbonus,
                 a.dev_cutoff,  a.dev_cscale,  a.dev_cbonus);
@@ -326,8 +318,7 @@ int main(int argc, char** argv) {
     base_cfg.iterations       = a.base_iters;
     base_cfg.ucb_c            = a.base_ucb_c;
     base_cfg.rollout_epsilon  = a.base_eps;
-    base_cfg.n_parallel_trees = a.base_trees;
-    base_cfg.lazy_expansion   = a.base_lazy != 0;
+    base_cfg.fpu_reduction    = a.base_fpu;
     base_cfg.tree_reuse       = a.base_reuse != 0;
     base_cfg.rollout_cutoff   = a.base_cutoff;
     base_cfg.cutoff_scale     = a.base_cscale;
@@ -339,8 +330,7 @@ int main(int argc, char** argv) {
     dev_cfg.iterations        = a.dev_iters;
     dev_cfg.ucb_c             = a.dev_ucb_c;
     dev_cfg.rollout_epsilon   = a.dev_eps;
-    dev_cfg.n_parallel_trees  = a.dev_trees;
-    dev_cfg.lazy_expansion    = a.dev_lazy != 0;
+    dev_cfg.fpu_reduction     = a.dev_fpu;
     dev_cfg.tree_reuse        = a.dev_reuse != 0;
     dev_cfg.rollout_cutoff    = a.dev_cutoff;
     dev_cfg.cutoff_scale      = a.dev_cscale;

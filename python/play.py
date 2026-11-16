@@ -387,7 +387,7 @@ class GameScreen(tk.Frame):
             raise RuntimeError(f"illegal move {action}: {info['error']}")
         advance = getattr(self.opp_fn, 'advance', None)
         if advance is not None:
-            advance(action)
+            advance(action, card)
 
         if rec:
             entry = {

@@ -134,12 +134,20 @@ void GameState::legal_moves_for(int player, MoveList& out) const {
 
     // Phase 1 — collect real placements per card. We track which slots
     // contributed nothing (dead cards) for the dead-card pass below.
+    //
+    // Two copies of the same card in hand are the same moves, so only
+    // the first slot holding a card type emits any: every move in the
+    // list is a distinct (card, target). Callers that pick uniformly or
+    // count visits per move would otherwise see such a move twice.
     bool slot_dead[HAND_SIZE];
     int  real_moves_before = out.count;
+    uint64_t seen_cards = 0;
 
     for (int slot = 0; slot < HAND_SIZE; ++slot) {
         int8_t card = hands[player][slot];
         if (card < 0) { slot_dead[slot] = false; continue; }
+        if (seen_cards & (uint64_t(1) << card)) { slot_dead[slot] = false; continue; }
+        seen_cards |= uint64_t(1) << card;
 
         int before = out.count;
 

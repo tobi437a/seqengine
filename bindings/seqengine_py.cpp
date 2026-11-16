@@ -123,8 +123,6 @@ PYBIND11_MODULE(_seqengine, m) {
         .def_readwrite("max_rollout_steps",       &MCTSConfig::max_rollout_steps)
         .def_readwrite("determinize",             &MCTSConfig::determinize)
         .def_readwrite("length_decay",            &MCTSConfig::length_decay)
-        .def_readwrite("prefer_completing_moves", &MCTSConfig::prefer_completing_moves)
-        .def_readwrite("lazy_expansion",          &MCTSConfig::lazy_expansion)
         .def_readwrite("fpu_reduction",           &MCTSConfig::fpu_reduction)
         .def_readwrite("tree_reuse",              &MCTSConfig::tree_reuse)
         .def_readwrite("rollout_cutoff",          &MCTSConfig::rollout_cutoff)
@@ -132,14 +130,18 @@ PYBIND11_MODULE(_seqengine, m) {
         .def_readwrite("cutoff_seq_bonus",        &MCTSConfig::cutoff_seq_bonus)
         .def_readwrite("jack2_value",             &MCTSConfig::jack2_value)
         .def_readwrite("jack1_value",             &MCTSConfig::jack1_value)
-        .def_readwrite("n_parallel_trees",        &MCTSConfig::n_parallel_trees)
+        .def_readwrite("dead_windows",            &MCTSConfig::dead_windows)
+        .def_readwrite("shaping_seq_bonus",       &MCTSConfig::shaping_seq_bonus)
+        .def_readwrite("random_ply_jacks",        &MCTSConfig::random_ply_jacks)
+        .def_readwrite("learned_policy",          &MCTSConfig::learned_policy)
+        .def_readwrite("learned_value",           &MCTSConfig::learned_value)
         .def_readwrite("n_threads",               &MCTSConfig::n_threads)
         .def_readwrite("seed",                    &MCTSConfig::seed)
         .def("__repr__", [](const MCTSConfig& c) {
             return "<MCTSConfig iters=" + std::to_string(c.iterations) +
                    " c=" + std::to_string(c.ucb_c) +
                    " ε=" + std::to_string(c.rollout_epsilon) +
-                   " trees=" + std::to_string(c.n_parallel_trees) + ">";
+                   " threads=" + std::to_string(c.n_threads) + ">";
         });
 
     py::class_<MCTSStats>(m, "MCTSStats")
@@ -148,7 +150,10 @@ PYBIND11_MODULE(_seqengine, m) {
         .def_readonly("seconds",           &MCTSStats::seconds)
         .def_readonly("best_move_visits",  &MCTSStats::best_move_visits)
         .def_readonly("best_move_winrate", &MCTSStats::best_move_winrate)
-        .def_readonly("root_legal_moves",  &MCTSStats::root_legal_moves);
+        .def_readonly("root_winrate",      &MCTSStats::root_winrate)
+        .def_readonly("root_legal_moves",  &MCTSStats::root_legal_moves)
+        .def_readonly("reused_visits",     &MCTSStats::reused_visits)
+        .def_readonly("threads",           &MCTSStats::threads);
 
     py::class_<MCTSEngine>(m, "MCTSEngine")
         .def(py::init<MCTSConfig>(), py::arg("config") = MCTSConfig{})
@@ -163,7 +168,13 @@ PYBIND11_MODULE(_seqengine, m) {
                  GameState s = build_state_from_py(
                      board_chips, hands, deck, current_player,
                      sequences, dead_card_used);
-                 Move m = eng.suggest_move(s);
+                 Move m;
+                 {
+                     // The search touches no Python objects; let other
+                     // Python threads (e.g. a GUI) run meanwhile.
+                     py::gil_scoped_release release;
+                     m = eng.suggest_move(s);
+                 }
                  int row, col;
                  if (m.is_dead()) { row = -1; col = -1; }
                  else { row = row_of(m.cell); col = col_of(m.cell); }
@@ -178,25 +189,27 @@ PYBIND11_MODULE(_seqengine, m) {
              "Pick a move for current_player. Returns (card_idx, row, col); "
              "row=col=-1 means a dead-card declaration.")
         .def("advance",
-             [](MCTSEngine& eng, int card_idx, int row, int col) {
-                 Move m;
-                 m.card_idx = int8_t(card_idx);
-                 if (row < 0 || col < 0) {
-                     m.cell = Move::DEAD;
-                 } else {
+             [](MCTSEngine& eng, int card, int row, int col) {
+                 if (card < 0 || card >= N_CARD_TYPES) {
+                     throw std::invalid_argument("card must be 0..49");
+                 }
+                 int cell = Move::DEAD;
+                 if (row >= 0 && col >= 0) {
                      if (row >= N_ROWS || col >= N_COLS) {
                          throw std::invalid_argument("row/col out of range");
                      }
-                     m.cell = int8_t(cell_of(row, col));
+                     cell = cell_of(row, col);
                  }
-                 eng.advance(m);
+                 eng.advance_card(card, cell);
              },
-             py::arg("card_idx"),
+             py::arg("card"),
              py::arg("row"),
              py::arg("col"),
              "Report a move actually played in the game (by either side, "
-             "in order) so tree_reuse can re-root the kept forest at the "
-             "next suggest_move. row=col=-1 means a dead-card declaration. "
-             "Optional: if never called, every search starts fresh.")
+             "in order) so tree_reuse can re-root the kept tree at the "
+             "next suggest_move. `card` is the card that was played, in "
+             "the 0..49 encoding (not a hand slot). row=col=-1 means a "
+             "dead-card declaration. Optional: if never called, every "
+             "search starts fresh.")
         .def("last_stats", [](MCTSEngine& eng) { return eng.last_stats(); });
 }

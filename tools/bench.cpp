@@ -160,15 +160,15 @@ int main() {
     }
 
     // --- Benchmark 4: MCTS iterations/s ---
-    // Root-parallel: n_parallel_trees=BENCH_THREADS, n_threads=BENCH_THREADS,
-    // so one independent tree per worker. iterations and N_MOVES are bumped
-    // so the phase wall time matches the others.
-    {
+    // The search as it is actually used: one shared tree, n_threads
+    // workers. Reported for one thread and for BENCH_THREADS so the
+    // parallel scaling is visible; budgets are sized so each run takes
+    // around a second or more.
+    for (int threads : {1, BENCH_THREADS}) {
         const int N_MOVES = 40;
         MCTSConfig cfg;
-        cfg.iterations       = 20000;
-        cfg.n_parallel_trees = BENCH_THREADS;
-        cfg.n_threads        = BENCH_THREADS;
+        cfg.iterations       = threads == 1 ? 20000 : 200000;
+        cfg.n_threads        = threads;
         cfg.seed             = 0xDEADBEEFCAFE;
         MCTSEngine eng(cfg);
 
@@ -185,11 +185,11 @@ int main() {
             total_iters += eng.last_stats().iterations;
         }
 
-        std::printf("MCTS iters:       %lld iters / %d moves in %.3fs  =>  %5.1fk iters/s   (%.1f ms/move)   [%d threads, %d trees]\n",
+        std::printf("MCTS iters:       %lld iters / %d moves in %.3fs  =>  %6.1fk iters/s   (%.1f ms/move)   [%d thread%s]\n",
                     total_iters, N_MOVES, total_sec,
                     double(total_iters) / total_sec / 1000.0,
                     total_sec / N_MOVES * 1000.0,
-                    cfg.n_threads, cfg.n_parallel_trees);
+                    cfg.n_threads, cfg.n_threads == 1 ? "" : "s");
     }
 
     return 0;

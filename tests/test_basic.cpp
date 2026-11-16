@@ -161,10 +161,18 @@ static void test_initial_move_count() {
     // At game start the board is empty, so every regular card has 2 legal
     // placements, every two-eyed jack has 96 (100 - 4 joker corners), and
     // every one-eyed jack is dead (no opponent chips on the board).
-    // Lower bound: 7 cards * 2 = 14 (if all regular). Upper bound: dominated
-    // by jacks.
-    std::printf("  initial legal moves: %d\n", moves.size());
-    CHECK(moves.size() >= 14);
+    // Moves are per distinct card, so the lower bound is 2 per distinct
+    // regular card in hand (7 * 2 = 14 with no pairs). Upper bound:
+    // dominated by jacks.
+    int distinct = 0;
+    for (int i = 0; i < HAND_SIZE; ++i) {
+        bool first = true;
+        for (int k = 0; k < i; ++k) first &= (s.hands[0][k] != s.hands[0][i]);
+        if (first && s.hands[0][i] != ONE_EYED_JACK) ++distinct;
+    }
+    std::printf("  initial legal moves: %d (%d distinct playable cards)\n",
+                moves.size(), distinct);
+    CHECK(moves.size() >= 2 * distinct);
     CHECK(moves.size() <= MAX_MOVES);
 }
 
@@ -373,6 +381,78 @@ static void test_mcts_self_play_smoke() {
     std::printf("  game finished in %d plies, winner=%d\n", plies, s.winner);
 }
 
+// Two copies of a card in hand are one move, not two.
+static void test_legal_moves_are_distinct() {
+    SECTION("legal moves are distinct (card, target) pairs");
+    GameState s;
+    s.reset(7);
+    // Two two-eyed jacks, a pair of regular cards, and filler.
+    s.hands[0][0] = int8_t(TWO_EYED_JACK);
+    s.hands[0][1] = int8_t(TWO_EYED_JACK);
+    s.hands[0][2] = 5;
+    s.hands[0][3] = 5;
+    MoveList moves;
+    s.legal_moves(moves);
+    int dups = 0, jack_moves = 0, card5_moves = 0;
+    for (int i = 0; i < moves.count; ++i) {
+        int ci = s.hands[0][moves.moves[i].card_idx];
+        if (ci == TWO_EYED_JACK) ++jack_moves;
+        if (ci == 5) ++card5_moves;
+        for (int k = i + 1; k < moves.count; ++k) {
+            int ck = s.hands[0][moves.moves[k].card_idx];
+            if (ci == ck && moves.moves[i].cell == moves.moves[k].cell) ++dups;
+        }
+    }
+    CHECK(dups == 0);
+    CHECK(jack_moves == 96);        // every non-joker cell, once
+    CHECK(card5_moves == 2);        // the card's two board cells, once each
+}
+
+// The search's internal fast paths agree with GameState and eval.hpp.
+static void test_search_selfcheck() {
+    SECTION("search internals match GameState / eval.hpp");
+    int bad = search_selfcheck(300, 0x5E1FC4EC);
+    std::printf("  mismatches: %d\n", bad);
+    CHECK(bad == 0);
+}
+
+// Full games with tree reuse (advance) and a multi-threaded shared tree.
+static void test_mcts_reuse_and_threads() {
+    SECTION("MCTS tree reuse + multi-threaded search");
+    for (int threads : {1, 4}) {
+        MCTSConfig cfg;
+        cfg.iterations = 600;
+        cfg.n_threads  = threads;
+        cfg.seed = 0xFEEDFACE;
+        MCTSEngine a(cfg);
+        cfg.seed = 0xBADFEED;
+        MCTSEngine b(cfg);
+
+        GameState s;
+        s.reset(0x777 + threads);
+        int plies = 0, searches = 0, reused = 0;
+        while (!s.done && plies < 600) {
+            MCTSEngine& eng = (s.current_player == 0) ? a : b;
+            Move m = eng.suggest_move(s);
+            if (eng.last_stats().iterations > 0) {
+                ++searches;
+                if (eng.last_stats().reused_visits > 0) ++reused;
+                CHECK(eng.last_stats().threads == threads);
+            }
+            a.advance(s, m);
+            b.advance(s, m);
+            CHECK(s.make_move(m));
+            ++plies;
+        }
+        CHECK(s.done);
+        // After the opening, nearly every search should start from a
+        // carried-over subtree.
+        CHECK(reused * 2 > searches);
+        std::printf("  threads=%d: %d plies, %d/%d searches reused the tree\n",
+                    threads, plies, reused, searches);
+    }
+}
+
 int main() {
     test_horizontal_sequence();
     test_joker_corner_in_sequence();
@@ -387,6 +467,9 @@ int main() {
 
     test_mcts_finds_obvious_win();
     test_mcts_self_play_smoke();
+    test_legal_moves_are_distinct();
+    test_search_selfcheck();
+    test_mcts_reuse_and_threads();
 
     std::printf("\n----\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     if (iterations <= 0) iterations = 1000;
 
     std::printf("=== Sequence engine profile ===\n");
-    std::printf("Games: %d   Iterations/move: %d   Threads: 1   Trees: 8 (default)\n\n",
+    std::printf("Games: %d   Iterations/move: %d   Threads: 1\n\n",
                 n_games, iterations);
 
 #ifndef SEQ_PROFILE
@@ -105,11 +105,11 @@ int main(int argc, char** argv) {
             Move m = (s.current_player == 0)
                         ? eng_a.suggest_move(s)
                         : eng_b.suggest_move(s);
-            if (!s.make_move(m)) break;
             // Tree reuse: report the played move to both engines so the
             // profiled workload matches how the harnesses drive play.
-            eng_a.advance(m);
-            eng_b.advance(m);
+            eng_a.advance(s, m);
+            eng_b.advance(s, m);
+            if (!s.make_move(m)) break;
             ++plies;
         }
         total_plies += plies;
